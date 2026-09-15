@@ -23,6 +23,17 @@ try:
 except ImportError:
     OpenAI = None
 
+# ── Video-streaming deps (optional — server still runs without them) ──
+try:
+    import cv2 as _cv2
+except ImportError:
+    _cv2 = None
+
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
+
 if not hasattr(pkgutil, "get_loader"):
     def _get_loader_compat(name):
         try:
@@ -2056,6 +2067,137 @@ def list_simulated_images():
         images = [f for f in os.listdir(sim_dir) if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif"))]
         return jsonify({"images": images})
     return jsonify({"images": []})
+
+
+# =====================================================================
+# VIDEO STREAMING
+# =====================================================================
+
+# ── Config ────────────────────────────────────────────────────────────
+#   Override ESP32_CAM_URL in .env to point at your ESP32-CAM IP:
+#     ESP32_CAM_URL=http://192.168.1.100:81/stream
+ESP32_CAM_URL = os.getenv("ESP32_CAM_URL", "http://192.168.1.100:81/stream")
+
+# Lazy-init USB camera so the server starts even with no webcam attached
+_usb_camera = None
+_cam_lock    = threading.Lock()
+
+def _get_camera():
+    """Return a cv2.VideoCapture object, creating it on first call."""
+    global _usb_camera
+    if _cv2 is None:
+        return None
+    with _cam_lock:
+        if _usb_camera is None or not _usb_camera.isOpened():
+            _usb_camera = _cv2.VideoCapture(0)
+    return _usb_camera
+
+
+def _gen_local_frames():
+    """Yield MJPEG frames from the local USB webcam."""
+    cam = _get_camera()
+    if cam is None:
+        return
+    while True:
+        ok, frame = cam.read()
+        if not ok:
+            break
+        _, buf = _cv2.imencode(
+            ".jpg", frame,
+            [_cv2.IMWRITE_JPEG_QUALITY, int(os.getenv("VIDEO_QUALITY", "70"))]
+        )
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n"
+            + buf.tobytes()
+            + b"\r\n"
+        )
+
+
+@app.route("/video_feed")
+def video_feed():
+    """
+    Option A – Local USB webcam on the ground-station PC.
+    Opens camera index 0; change VIDEO_DEVICE_INDEX in .env to use a
+    different camera (e.g. 1 for an external USB cam).
+    """
+    if _cv2 is None:
+        return jsonify({"error": "opencv-python not installed"}), 503
+
+    device = int(os.getenv("VIDEO_DEVICE_INDEX", "0"))
+
+    def gen():
+        cam = _cv2.VideoCapture(device)
+        if not cam.isOpened():
+            return
+        try:
+            while True:
+                ok, frame = cam.read()
+                if not ok:
+                    break
+                _, buf = _cv2.imencode(
+                    ".jpg", frame,
+                    [_cv2.IMWRITE_JPEG_QUALITY, int(os.getenv("VIDEO_QUALITY", "70"))]
+                )
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + buf.tobytes()
+                    + b"\r\n"
+                )
+        finally:
+            cam.release()
+
+    return Response(
+        stream_with_context(gen()),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.route("/video_feed_esp")
+def video_feed_esp():
+    """
+    Option B – ESP32-CAM inside the CanSat or mounted on the ground station.
+    Set ESP32_CAM_URL in .env, e.g.:
+        ESP32_CAM_URL=http://192.168.1.100:81/stream
+    Flash the built-in CameraWebServer example onto your AI-Thinker ESP32-CAM,
+    note the IP from Serial Monitor, and update the URL above.
+    """
+    if _requests is None:
+        return jsonify({"error": "requests package not installed"}), 503
+
+    def proxy():
+        try:
+            r = _requests.get(ESP32_CAM_URL, stream=True, timeout=10)
+            for chunk in r.iter_content(chunk_size=1024):
+                yield chunk
+        except Exception as exc:
+            app.logger.warning("ESP32-CAM proxy error: %s", exc)
+
+    # The ESP32 CameraWebServer sketch uses this multipart boundary
+    return Response(
+        stream_with_context(proxy()),
+        content_type="multipart/x-mixed-replace; boundary=123456789000000000000987654321"
+    )
+
+
+@app.route("/api/video/status")
+def video_status():
+    """Quick health-check for the video integration."""
+    cam_ok = False
+    if _cv2 is not None:
+        cap = _cv2.VideoCapture(int(os.getenv("VIDEO_DEVICE_INDEX", "0")))
+        cam_ok = cap.isOpened()
+        cap.release()
+    return jsonify({
+        "opencv_available": _cv2 is not None,
+        "requests_available": _requests is not None,
+        "local_camera_detected": cam_ok,
+        "esp32_cam_url": ESP32_CAM_URL,
+    })
+
+
+
 
 
 # =====================================================================

@@ -120,6 +120,7 @@
             <div class="tab" data-t="events" role="tab">Events</div>
             <div class="tab" data-t="components" role="tab">Components</div>
             <div class="tab" data-t="simulated" role="tab">Simulation</div>
+            <div class="tab" data-t="video" role="tab">📷 Live Feed</div>
         </nav>
 
         <!-- DASHBOARD -->
@@ -587,6 +588,38 @@
                 <div id="simOut">
                     <div class="sim-placeholder">Scanning for simulated outputs…</div>
                 </div>
+            </section>
+        </div>
+
+    </div>
+
+        <!-- VIDEO FEED -->
+        <div class="panel" id="p-video">
+            <section class="card">
+                <div class="video-card-hdr">
+                    <div class="ct">📷 Live Camera Feed</div>
+                    <div class="video-controls">
+                        <button class="btn btn-ghost btn-xs" id="btnVidUSB" type="button" title="Switch to local USB webcam">USB Cam</button>
+                        <button class="btn btn-ghost btn-xs" id="btnVidESP" type="button" title="Switch to ESP32-CAM stream">ESP32-CAM</button>
+                        <button class="btn btn-ghost btn-xs" id="btnVidSnap" type="button" title="Download snapshot">⬇ Snap</button>
+                        <span id="vidBadge" class="badge-live">LIVE</span>
+                    </div>
+                </div>
+
+                <div class="video-wrapper">
+                    <img id="liveFeed"
+                         src="/video_feed"
+                         alt="Live camera feed"
+                         onerror="handleVideoError()"
+                         onload="handleVideoLoad()" />
+                    <div id="vidOverlay" class="vid-offline hidden">📡 No Signal</div>
+                </div>
+
+                <p class="video-hint">
+                    USB Cam streams via <code>/video_feed</code> &nbsp;·&nbsp;
+                    ESP32-CAM streams via <code>/video_feed_esp</code> &nbsp;·&nbsp;
+                    Set <code>ESP32_CAM_URL</code> in <code>.env</code>
+                </p>
             </section>
         </div>
 

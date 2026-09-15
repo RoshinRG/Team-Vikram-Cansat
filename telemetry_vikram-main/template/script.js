@@ -31,7 +31,7 @@ let pollTimer = null;
 let sseFailCount = 0;
 let lastResetToastAt = 0;
 let lastAiFetchAt = 0;
-const TAB_ORDER = ['dashboard', 'map', 'orientation', 'analysis', 'commands', 'events', 'components', 'simulated'];
+const TAB_ORDER = ['dashboard', 'map', 'orientation', 'analysis', 'commands', 'events', 'components', 'simulated', 'video'];
 const GAUGE_CIRC = 2 * Math.PI * 30; // r=30
 const GS_TOKEN = localStorage.getItem('gsToken') || 'vikram-gs-local';
 const CHART_POINT_CAP = 500;
@@ -1860,4 +1860,83 @@ window.addEventListener('load', async () => {
     setInterval(loadSessions, 20000);
     setTimeout(() => map && map.invalidateSize(), 500);
     toast('VIKRAM online', 'Mission control ready', 'ok');
+
+    // ── Video feed buttons ──────────────────────────────────────────
+    document.getElementById('btnVidUSB').addEventListener('click', () => {
+        switchVideoSource('/video_feed');
+    });
+    document.getElementById('btnVidESP').addEventListener('click', () => {
+        switchVideoSource('/video_feed_esp');
+    });
+    document.getElementById('btnVidSnap').addEventListener('click', takeVideoSnapshot);
 });
+
+/* ════════════════ VIDEO FEED ════════════════ */
+let _vidRetryTimer = null;
+
+/**
+ * Called by the <img> onerror attribute when the stream breaks.
+ * Shows the offline overlay and schedules a retry in 5 s.
+ */
+function handleVideoError() {
+    const overlay = document.getElementById('vidOverlay');
+    const badge   = document.getElementById('vidBadge');
+    if (overlay) { overlay.classList.remove('hidden'); }
+    if (badge)   { badge.textContent = 'OFFLINE'; badge.classList.add('badge-offline'); }
+
+    clearTimeout(_vidRetryTimer);
+    _vidRetryTimer = setTimeout(() => {
+        const img = document.getElementById('liveFeed');
+        if (!img) return;
+        const base = img.src.split('?')[0];
+        img.src = base + '?t=' + Date.now();
+    }, 5000);
+}
+
+/**
+ * Called by the <img> onload attribute when a frame arrives successfully.
+ * Hides the offline overlay.
+ */
+function handleVideoLoad() {
+    const overlay = document.getElementById('vidOverlay');
+    const badge   = document.getElementById('vidBadge');
+    if (overlay) { overlay.classList.add('hidden'); }
+    if (badge)   { badge.textContent = 'LIVE'; badge.classList.remove('badge-offline'); }
+    clearTimeout(_vidRetryTimer);
+}
+
+/**
+ * Switch between USB-cam (/video_feed) and ESP32-CAM (/video_feed_esp).
+ * @param {string} url - the Flask route to stream from
+ */
+function switchVideoSource(url) {
+    clearTimeout(_vidRetryTimer);
+    const img = document.getElementById('liveFeed');
+    if (!img) return;
+    img.src = url + '?t=' + Date.now();
+    toast('Video', 'Switching to ' + url, 'ok');
+}
+
+/**
+ * Take a snapshot of the current MJPEG frame by drawing the <img> onto a
+ * canvas, then triggering a download.
+ */
+function takeVideoSnapshot() {
+    const img = document.getElementById('liveFeed');
+    if (!img || !img.complete || img.naturalWidth === 0) {
+        toast('Video', 'No live frame to capture', 'warn');
+        return;
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width  = img.naturalWidth  || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const ts   = new Date().toISOString().replace(/[:.]/g, '-');
+    const link = document.createElement('a');
+    link.download = 'cansat-snap-' + ts + '.jpg';
+    link.href = canvas.toDataURL('image/jpeg', 0.92);
+    link.click();
+    toast('Video', 'Snapshot saved', 'ok');
+}
+
