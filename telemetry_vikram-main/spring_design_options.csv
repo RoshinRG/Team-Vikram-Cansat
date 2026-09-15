@@ -1,0 +1,9 @@
+d_mm,D_mm,C,Na,L_solid_mm,L_free_mm,OD_mm,ID_mm,fmax_N,tau_MPa,ssy_MPa,stress_margin,slenderness,buckling_critical_ratio,buckling_margin,clash_margin_mm,surge_freq_hz,surge_margin,guide_rod_required,passes_all_checks,notes
+3.2,38.4,12.0,35.1,118.6,818.6,41.6,35.2,366.5,1224.2,840.5,0.46,21.32,3.7,0.17,0.0,22.1,5.2,True,False,"FAILS stress, guide rod mandatory (buckles unguided), surge freq low"
+6.2,93.0,15.0,34.8,228.0,928.0,99.2,86.8,366.5,398.6,763.7,1.28,9.98,3.7,0.37,0.0,7.4,1.7,True,False,"guide rod mandatory (buckles unguided), surge freq low"
+4.0,52.0,13.0,34.5,145.9,845.9,56.0,48.0,366.5,841.5,813.8,0.64,16.27,3.7,0.23,0.0,15.3,3.6,True,False,"FAILS stress, guide rod mandatory (buckles unguided), surge freq low"
+5.0,70.0,14.0,34.5,182.5,882.5,75.0,65.0,366.5,575.7,787.9,0.91,12.61,3.7,0.29,0.0,10.6,2.5,True,False,"FAILS stress, guide rod mandatory (buckles unguided), surge freq low"
+2.4,26.4,11.0,34.1,86.7,786.7,28.8,24.0,366.5,2015.5,876.3,0.29,29.8,3.7,0.12,0.0,36.1,8.4,True,False,"FAILS stress, guide rod mandatory (buckles unguided), surge freq low"
+5.2,72.8,14.0,35.9,197.0,897.0,78.0,67.6,366.5,532.3,783.4,0.98,12.32,3.7,0.3,0.0,9.8,2.3,True,False,"FAILS stress, guide rod mandatory (buckles unguided), surge freq low"
+6.4,96.0,15.0,35.9,242.6,942.6,102.4,89.6,366.5,374.1,760.2,1.35,9.82,3.7,0.38,0.0,6.9,1.6,True,False,"guide rod mandatory (buckles unguided), surge freq low"
+4.2,54.6,13.0,36.2,160.4,860.4,58.8,50.4,366.5,763.3,808.0,0.71,15.76,3.7,0.23,0.0,13.9,3.2,True,False,"FAILS stress, guide rod mandatory (buckles unguided), surge freq low"

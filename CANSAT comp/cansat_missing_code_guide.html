@@ -1,0 +1,341 @@
+
+<style>
+  .root { padding: 1rem 0; font-family: var(--font-mono); }
+  .section { margin-bottom: 1.5rem; border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg); overflow: hidden; }
+  .sec-head { padding: 10px 16px; background: var(--color-background-secondary); display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+  .sec-head span.tag { font-size: 11px; padding: 2px 8px; border-radius: var(--border-radius-md); font-weight: 500; }
+  .tag-back { background: var(--color-background-danger); color: var(--color-text-danger); }
+  .tag-front { background: var(--color-background-info); color: var(--color-text-info); }
+  .tag-both { background: var(--color-background-warning); color: var(--color-text-warning); }
+  .sec-head h3 { font-size: 13px; font-weight: 500; margin: 0; flex: 1; }
+  .sec-body { padding: 12px 16px; display: none; }
+  .sec-body.open { display: block; }
+  .item { margin-bottom: 10px; }
+  .item-title { font-size: 12px; font-weight: 500; color: var(--color-text-primary); margin-bottom: 3px; }
+  .item-where { font-size: 11px; color: var(--color-text-secondary); margin-bottom: 4px; }
+  .code-hint { font-size: 11px; background: var(--color-background-secondary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-md); padding: 6px 10px; color: var(--color-text-info); white-space: pre-wrap; }
+  .copy-btn { font-size: 10px; border: 0.5px solid var(--color-border-secondary); border-radius: var(--border-radius-md); padding: 3px 8px; cursor: pointer; margin-top: 4px; background: transparent; color: var(--color-text-secondary); }
+  .copy-btn:hover { background: var(--color-background-secondary); }
+  .chevron { font-size: 14px; transition: transform 0.2s; }
+  .chevron.open { transform: rotate(180deg); }
+</style>
+<div class="root">
+  <h2 class="sr-only">CAN-7USAT missing code guide — click each section to expand</h2>
+  <p style="font-size:12px; color:var(--color-text-secondary); margin-bottom:1rem;">Click any section to expand. Each card shows what's missing, where to add it, and a code snippet.</p>
+  <div id="sections"></div>
+</div>
+<script>
+const data = [
+  {
+    title: "New Flask API endpoints (app.py)",
+    tag: "back", tagLabel: "Backend",
+    items: [
+      {
+        title: "POST /api/command — send uplink command",
+        where: "app.py → after existing /telemetry routes",
+        code: `@app.route('/api/command', methods=['POST'])
+def send_command():
+    cmd = request.json.get('command')
+    # write to serial: ser.write((cmd+'\\n').encode())
+    db.execute("INSERT INTO commands(session_id,command,status,sent_at) VALUES(?,?,?,?)",
+               (session_id, cmd, 'SENT', datetime.utcnow()))
+    return jsonify({"status":"ok","command":cmd})`
+      },
+      {
+        title: "GET /api/commands/log — command history",
+        where: "app.py → after /api/command",
+        code: `@app.route('/api/commands/log')
+def commands_log():
+    rows = db.execute("SELECT * FROM commands ORDER BY sent_at DESC").fetchall()
+    return jsonify([dict(r) for r in rows])`
+      },
+      {
+        title: "GET/POST /api/events — mission event log",
+        where: "app.py → after /api/commands/log",
+        code: `@app.route('/api/events', methods=['GET','POST'])
+def events():
+    if request.method == 'POST':
+        d = request.json
+        db.execute("INSERT INTO mission_events(session_id,event_type,event_note,altitude,created_at) VALUES(?,?,?,?,?)",
+                   (session_id,'MANUAL',d.get('note'),d.get('altitude'),datetime.utcnow()))
+        return jsonify({"status":"ok"})
+    rows = db.execute("SELECT * FROM mission_events ORDER BY created_at DESC").fetchall()
+    return jsonify([dict(r) for r in rows])`
+      },
+      {
+        title: "GET /api/sessions + /api/sessions/<id>/export",
+        where: "app.py → after /api/events",
+        code: `@app.route('/api/sessions')
+def sessions():
+    rows = db.execute("SELECT DISTINCT session_id,MIN(received_at),MAX(received_at),COUNT(*) FROM telemetry GROUP BY session_id").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/sessions/<sid>/export')
+def session_export(sid):
+    rows = db.execute("SELECT * FROM telemetry WHERE session_id=?", (sid,)).fetchall()
+    # stream as CSV (same logic as /db/export but filtered by sid)
+    ...`
+      },
+      {
+        title: "GET /api/anomalies, /api/link-margin, POST /api/port",
+        where: "app.py → after /api/sessions",
+        code: `@app.route('/api/anomalies')
+def anomalies():
+    # return stored anomaly list from in-memory or DB
+    return jsonify(anomaly_log)
+
+@app.route('/api/link-margin')
+def link_margin():
+    sensitivity_floor = -120  # dBm LoRa typical
+    rows = db.execute("SELECT rssi,snr FROM telemetry ORDER BY received_at DESC LIMIT 100").fetchall()
+    margins = [{"rssi":r["rssi"],"snr":r["snr"],"margin":r["rssi"]-sensitivity_floor} for r in rows]
+    return jsonify(margins)
+
+@app.route('/api/port', methods=['POST'])
+def set_port():
+    port = request.json.get('port')
+    # reconnect serial on new port
+    return jsonify({"status":"ok","port":port})`
+      },
+    ]
+  },
+  {
+    title: "Flight Phase State Machine (app.py)",
+    tag: "back", tagLabel: "Backend",
+    items: [
+      {
+        title: "FSM logic — detect phase from packet fields",
+        where: "app.py → inside packet_handler() function after parsing JSON",
+        code: `def detect_phase(pkt, prev_alt, prev_phase):
+    alt, az = pkt['alt'], pkt['az']
+    rising = alt > prev_alt
+    if not pkt['launched']:       return 'PRE-LAUNCH'
+    if pkt['ejected'] and not rising: return 'RECOVERY'
+    if alt < prev_alt and not pkt['ejected']: return 'DESCENT'
+    if abs(alt - prev_alt) < 0.5: return 'APOGEE'
+    if rising and az > 1.5:       return 'POWERED_ASCENT'
+    if rising and az > 2.0:       return 'IGNITION'
+    if rising:                    return 'COAST'
+    return prev_phase`
+      },
+      {
+        title: "Log phase transitions to mission_events",
+        where: "app.py → right after detect_phase() call",
+        code: `new_phase = detect_phase(pkt, prev_alt, current_phase)
+if new_phase != current_phase:
+    db.execute("INSERT INTO mission_events(session_id,event_type,event_note,altitude,created_at) VALUES(?,?,?,?,?)",
+               (session_id, new_phase, f'Phase → {new_phase}', pkt['alt'], datetime.utcnow()))
+    current_phase = new_phase`
+      }
+    ]
+  },
+  {
+    title: "Command Bar (index.html JS)",
+    tag: "front", tagLabel: "Frontend",
+    items: [
+      {
+        title: "sendCommand() — ARM / DEPLOY / ABORT / SIM",
+        where: "index.html → <script> section, add this function",
+        code: `async function sendCommand(cmd) {
+  if (cmd === 'ABORT' && !confirm('ABORT mission? Are you sure?')) return;
+  const res = await fetch('/api/command', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({command: cmd})
+  });
+  const d = await res.json();
+  document.getElementById('cmd-status-'+cmd).textContent = d.status;
+  loadCommandLog();
+}`
+      },
+      {
+        title: "Command bar HTML",
+        where: "index.html → bottom of <body>, before status bar",
+        code: `<div id="cmd-bar">
+  <button onclick="sendCommand('ARM')">ARM</button>
+  <span id="cmd-status-ARM" class="badge"></span>
+  <button onclick="sendCommand('DEPLOY')">DEPLOY</button>
+  <span id="cmd-status-DEPLOY" class="badge"></span>
+  <button class="danger" onclick="sendCommand('ABORT')">ABORT ⚠</button>
+  <span id="cmd-status-ABORT" class="badge"></span>
+  <button onclick="sendCommand(simOn?'SIM_OFF':'SIM_ON')" id="sim-btn">SIM ON</button>
+  <select id="port-sel" onchange="changePort(this.value)"></select>
+</div>`
+      }
+    ]
+  },
+  {
+    title: "GPS Map — Leaflet.js (index.html)",
+    tag: "front", tagLabel: "Frontend",
+    items: [
+      {
+        title: "Init map + track polyline",
+        where: "index.html → inside initDashboard() or DOMContentLoaded",
+        code: `const map = L.map('map-panel').setView([12.97, 77.59], 15);
+L.tileLayer('/static/tiles/{z}/{x}/{y}.png',{maxZoom:18}).addTo(map);
+const track = L.polyline([], {color:'#00d4ff',weight:2}).addTo(map);
+let launched_marker, apogee_marker;
+
+function updateMap(pkt) {
+  const ll = [pkt.lat, pkt.lon];
+  track.addLatLng(ll);
+  map.setView(ll);
+  if (pkt.launched && !launched_marker)
+    launched_marker = L.marker(ll,{title:'Launch'}).addTo(map);
+  if (pkt.ejected && !apogee_marker)
+    apogee_marker = L.marker(ll,{title:'Parachute'}).addTo(map);
+}`
+      }
+    ]
+  },
+  {
+    title: "3D Rocket Model — Three.js (index.html)",
+    tag: "front", tagLabel: "Frontend",
+    items: [
+      {
+        title: "Load STL + update orientation from accel/gyro",
+        where: "index.html → inside <script> after Three.js loads",
+        code: `const scene = new THREE.Scene();
+const cam = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+cam.position.set(0, 0, 5);
+const renderer = new THREE.WebGLRenderer({canvas: document.getElementById('rocket-canvas'), alpha:true});
+renderer.setSize(300, 300);
+
+const loader = new THREE.STLLoader();
+loader.load('/api/model-stl', geo => {
+  const mesh = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({color:0x00d4ff}));
+  scene.add(mesh);
+  window._rocketMesh = mesh;
+});
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+
+function updateRocket(pkt) {
+  if (!window._rocketMesh) return;
+  window._rocketMesh.rotation.x = Math.atan2(pkt.ay, pkt.az);
+  window._rocketMesh.rotation.z = Math.atan2(pkt.ax, pkt.az);
+}
+(function animate(){ requestAnimationFrame(animate); renderer.render(scene,cam); })();`
+      }
+    ]
+  },
+  {
+    title: "AI Analysis Panel (index.html)",
+    tag: "front", tagLabel: "Frontend",
+    items: [
+      {
+        title: "Poll /api/ai-analysis/latest every 30s",
+        where: "index.html → inside startPolling() function",
+        code: `setInterval(async () => {
+  const r = await fetch('/api/ai-analysis/latest');
+  const d = await r.json();
+  document.getElementById('ai-text').textContent = d.analysis || 'No analysis yet';
+  document.getElementById('ai-provider').textContent = d.provider || '';
+  document.getElementById('ai-anomalies').textContent = d.anomaly_count ?? 0;
+  const list = document.getElementById('ai-anomaly-list');
+  list.innerHTML = (d.anomalies||[]).map(a =>
+    \`<li>\${a.time} — \${a.description}</li>\`).join('');
+}, 30000);`
+      }
+    ]
+  },
+  {
+    title: "Contact Lost Alert + auto-reconnect (index.html)",
+    tag: "front", tagLabel: "Frontend",
+    items: [
+      {
+        title: "5-second watchdog timer",
+        where: "index.html → inside main polling loop (setInterval 1s)",
+        code: `let lastPacketTime = Date.now();
+
+// inside your 1Hz poll callback, after receiving a packet:
+lastPacketTime = Date.now();
+
+// separate 1s watchdog:
+setInterval(() => {
+  const stale = (Date.now() - lastPacketTime) > 5000;
+  document.getElementById('contact-lost-banner').style.display = stale ? 'block' : 'none';
+  if (stale) autoReconnect();
+}, 1000);
+
+function autoReconnect() {
+  fetch('/api/port', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({port: currentPort})});
+}`
+      }
+    ]
+  },
+  {
+    title: "Audio Alerts — Web Audio API (index.html)",
+    tag: "front", tagLabel: "Frontend",
+    items: [
+      {
+        title: "Beep on anomaly or parachute deploy",
+        where: "index.html → top of <script>",
+        code: `const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function beep(freq=880, dur=0.15, vol=0.3) {
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.start(); osc.stop(audioCtx.currentTime + dur);
+}
+// call beep(440) on anomaly, beep(660) on ejection detected`
+      }
+    ]
+  },
+  {
+    title: "Auto CSV export on ejection (index.html)",
+    tag: "both", tagLabel: "Both",
+    items: [
+      {
+        title: "Trigger export when ejected=true first seen",
+        where: "index.html → inside updateDisplay(pkt) function",
+        code: `let ejectionExported = false;
+function updateDisplay(pkt) {
+  // ... existing update code ...
+  if (pkt.ejected && !ejectionExported) {
+    ejectionExported = true;
+    window.open('/db/export', '_blank');  // triggers CSV download
+    beep(660);  // audio alert
+  }
+}`
+      }
+    ]
+  }
+];
+
+const container = document.getElementById('sections');
+data.forEach((sec, i) => {
+  const el = document.createElement('div');
+  el.className = 'section';
+  const tagClass = sec.tag === 'back' ? 'tag-back' : sec.tag === 'front' ? 'tag-front' : 'tag-both';
+  el.innerHTML = `<div class="sec-head" onclick="toggle(${i})">
+    <span class="tag ${tagClass}">${sec.tagLabel}</span>
+    <h3>${sec.title}</h3>
+    <i class="ti ti-chevron-down chevron" id="chev-${i}" aria-hidden="true"></i>
+  </div>
+  <div class="sec-body" id="body-${i}">
+    ${sec.items.map((it, j) => `<div class="item">
+      <div class="item-title">${it.title}</div>
+      <div class="item-where">📍 ${it.where}</div>
+      <div class="code-hint" id="code-${i}-${j}">${it.code.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+      <button class="copy-btn" onclick="copyCode(${i},${j})">copy</button>
+    </div>`).join('<hr style="border:none;border-top:0.5px solid var(--color-border-tertiary);margin:10px 0">')}
+  </div>`;
+  container.appendChild(el);
+});
+
+function toggle(i) {
+  const body = document.getElementById('body-'+i);
+  const chev = document.getElementById('chev-'+i);
+  const open = body.classList.toggle('open');
+  chev.classList.toggle('open', open);
+}
+
+function copyCode(i, j) {
+  const text = document.getElementById(`code-${i}-${j}`).textContent;
+  navigator.clipboard.writeText(text);
+}
+</script>

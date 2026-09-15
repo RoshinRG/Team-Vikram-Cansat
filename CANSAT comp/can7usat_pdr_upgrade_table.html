@@ -1,0 +1,155 @@
+
+<style>
+  .wrap { padding: 1rem 0; font-size: 13px; }
+  h2 { font-size: 18px; font-weight: 500; margin: 0 0 4px; color: var(--color-text-primary); }
+  .sub { font-size: 13px; color: var(--color-text-secondary); margin: 0 0 1.25rem; }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 1rem; }
+  .pill { border: 0.5px solid var(--color-border-secondary); border-radius: 99px; padding: 4px 12px; font-size: 12px; cursor: pointer; background: transparent; color: var(--color-text-secondary); transition: background 0.15s; }
+  .pill.active-all { background: var(--color-background-secondary); color: var(--color-text-primary); border-color: var(--color-border-primary); }
+  .pill.active-critical { background: #FCEBEB; color: #A32D2D; border-color: #F09595; }
+  .pill.active-high { background: #FAEEDA; color: #854F0B; border-color: #EF9F27; }
+  .pill.active-standard { background: #EAF3DE; color: #3B6D11; border-color: #97C459; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th { text-align: left; font-size: 11px; font-weight: 500; color: var(--color-text-secondary); text-transform: uppercase; letter-spacing: 0.05em; padding: 6px 10px; border-bottom: 0.5px solid var(--color-border-secondary); background: var(--color-background-secondary); }
+  td { padding: 8px 10px; border-bottom: 0.5px solid var(--color-border-tertiary); vertical-align: top; color: var(--color-text-primary); line-height: 1.5; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--color-background-secondary); }
+  .badge { display: inline-block; border-radius: 99px; padding: 2px 8px; font-size: 11px; font-weight: 500; white-space: nowrap; }
+  .b-critical { background: #FCEBEB; color: #A32D2D; }
+  .b-high { background: #FAEEDA; color: #854F0B; }
+  .b-standard { background: #EAF3DE; color: #3B6D11; }
+  .sec-row td { background: var(--color-background-secondary); font-weight: 500; font-size: 12px; color: var(--color-text-secondary); }
+  .col-id { width: 52px; }
+  .col-pri { width: 80px; }
+  .col-sec { width: 130px; }
+  .col-cur { width: 220px; }
+  .col-upg { width: 220px; }
+  .dim { color: var(--color-text-secondary); font-size: 12px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 1.25rem; }
+  .stat { background: var(--color-background-secondary); border-radius: var(--border-radius-md); padding: 10px 12px; }
+  .stat-label { font-size: 11px; color: var(--color-text-secondary); margin-bottom: 4px; }
+  .stat-val { font-size: 20px; font-weight: 500; }
+  .sv-c { color: #A32D2D; } .sv-h { color: #854F0B; } .sv-s { color: #3B6D11; } .sv-t { color: var(--color-text-primary); }
+</style>
+<div class="wrap">
+  <h2>CAN-7USAT PDR — Upgrade List</h2>
+  <p class="sub">Ground Station Web Dashboard · v2.0 · May 2026</p>
+
+  <div class="summary-grid">
+    <div class="stat"><div class="stat-label">🔴 Critical</div><div class="stat-val sv-c">11</div></div>
+    <div class="stat"><div class="stat-label">🟡 High priority</div><div class="stat-val sv-h">17</div></div>
+    <div class="stat"><div class="stat-label">🟢 Standard</div><div class="stat-val sv-s">15</div></div>
+    <div class="stat"><div class="stat-label">Total items</div><div class="stat-val sv-t">43</div></div>
+  </div>
+
+  <div class="filters">
+    <button class="pill active-all" onclick="filter('all',this)">All (43)</button>
+    <button class="pill" onclick="filter('critical',this)">🔴 Critical</button>
+    <button class="pill" onclick="filter('high',this)">🟡 High priority</button>
+    <button class="pill" onclick="filter('standard',this)">🟢 Standard</button>
+  </div>
+
+  <div style="overflow-x: auto; border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg);">
+    <table id="tbl">
+      <colgroup>
+        <col class="col-id"><col class="col-pri"><col class="col-sec"><col class="col-cur"><col class="col-upg">
+      </colgroup>
+      <thead>
+        <tr>
+          <th>#</th><th>Priority</th><th>Section</th><th>Current state</th><th>Required upgrade</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const rows = [
+  {id:"1.1",pri:"critical",sec:"1 · Dashboard",cur:"Only alt, ax/ay/az, gx/gy/gz displayed",upg:"Add temperature, pressure, humidity, GPS (lat/lon), battery voltage, RSSI/SNR fields to the UI"},
+  {id:"1.2",pri:"critical",sec:"1 · Dashboard",cur:"No GPS tracking panel",upg:"Add live GPS map panel (Leaflet.js / OpenStreetMap) showing CanSat position in real time"},
+  {id:"1.3",pri:"critical",sec:"1 · Dashboard",cur:"No voltage/power display",upg:"Add battery voltage gauge and power status indicator"},
+  {id:"2.1",pri:"critical",sec:"2 · Telemetry Packet",cur:"alt, ax, ay, az, gx, gy, gz, launched, ejected, sim, ts",upg:"Add: temp, pressure, humidity, lat, lon, batt_v, rssi, snr, packet_id, mission_time"},
+  {id:"2.2",pri:"critical",sec:"2 · Telemetry Packet",cur:"No packet ID or sequence number",upg:"Add packet_id counter to detect packet loss"},
+  {id:"2.3",pri:"critical",sec:"2 · Telemetry Packet",cur:"No mission elapsed time",upg:"Add mission_time (seconds since launch)"},
+  {id:"3.1",pri:"critical",sec:"3 · Database",cur:"Stores only 12 fields",upg:"Extend telemetry table to include all new sensor columns"},
+  {id:"3.2",pri:"critical",sec:"3 · Database",cur:"No packet loss tracking",upg:"Add packet_id column and packet-loss calculation logic"},
+  {id:"3.3",pri:"critical",sec:"3 · Database",cur:"No mission session concept",upg:"Add session_id to group flights and support multiple flights"},
+  {id:"4.1",pri:"critical",sec:"4 · Flight Phase",cur:"Basic 7-phase logic (az/velocity based)",upg:"Add pressure-based apogee detection as cross-check"},
+  {id:"4.2",pri:"critical",sec:"4 · Flight Phase",cur:"No parachute deployment confirmation",upg:"Add ejected + descent rate cross-validation"},
+  {id:"4.3",pri:"critical",sec:"4 · Flight Phase",cur:"No IGNITION → COAST transition logging",upg:"Log phase transitions to DB with timestamp"},
+  {id:"5.1",pri:"high",sec:"5 · Real-Time Plots",cur:"Altitude, accel, gyro charts exist",upg:"Add Temperature vs Time chart"},
+  {id:"5.2",pri:"high",sec:"5 · Real-Time Plots",cur:"No pressure chart",upg:"Add Pressure vs Altitude dual-axis chart"},
+  {id:"5.3",pri:"high",sec:"5 · Real-Time Plots",cur:"No descent rate plot",upg:"Add Vertical Velocity / Descent Rate chart with parachute deployment marker"},
+  {id:"5.4",pri:"high",sec:"5 · Real-Time Plots",cur:"No GPS track plot",upg:"Add GPS trajectory plot (2D ground track + altitude profile)"},
+  {id:"5.5",pri:"high",sec:"5 · Real-Time Plots",cur:"No packet loss indicator on charts",upg:"Highlight missing packets in chart with gap/marker"},
+  {id:"6.1",pri:"high",sec:"6 · Command & Control",cur:"No uplink/command capability",upg:"Add uplink command panel (ARM, DEPLOY, ABORT, SIM-MODE toggle)"},
+  {id:"6.2",pri:"high",sec:"6 · Command & Control",cur:"No TX confirmation",upg:"Show command acknowledge status from CanSat"},
+  {id:"6.3",pri:"high",sec:"6 · Command & Control",cur:"Serial port selector is static",upg:"Add dynamic COM port selector dropdown in the UI"},
+  {id:"7.1",pri:"high",sec:"7 · Ground Station Arch",cur:"Single PC, USB-only",upg:"Document and support elevated antenna mount setup (portable mode)"},
+  {id:"7.2",pri:"high",sec:"7 · Ground Station Arch",cur:"No network relay",upg:"Add optional WebSocket relay for remote monitoring over LAN"},
+  {id:"7.3",pri:"high",sec:"7 · Ground Station Arch",cur:"No operator log",upg:"Add mission event log panel (timestamped: connect, launch, apogee, eject, land)"},
+  {id:"8.1",pri:"high",sec:"8 · CSV / Data Export",cur:"CSV export works",upg:"Add per-session export (filter by session/flight)"},
+  {id:"8.2",pri:"high",sec:"8 · CSV / Data Export",cur:"No metadata in CSV",upg:"Include mission metadata header row (team name, date, CanSat ID)"},
+  {id:"8.3",pri:"high",sec:"8 · CSV / Data Export",cur:"No auto-export trigger",upg:"Auto-export CSV when ejected = True (post-flight trigger)"},
+  {id:"9.1",pri:"standard",sec:"9 · AI Analysis",cur:"Gemini 2.0 Flash analysis every 15s",upg:"Upgrade prompt to include temperature, pressure, GPS data"},
+  {id:"9.2",pri:"standard",sec:"9 · AI Analysis",cur:"Fallback analysis is generic",upg:"Improve fallback to generate phase-specific structured reports"},
+  {id:"9.3",pri:"standard",sec:"9 · AI Analysis",cur:"No anomaly history",upg:"Display anomaly timeline — list all past anomalies with timestamps"},
+  {id:"10.1",pri:"standard",sec:"10 · FSM Tracking",cur:"No software FSM display",upg:"Add state machine panel showing FSM state in real time"},
+  {id:"10.2",pri:"standard",sec:"10 · FSM Tracking",cur:"No boot time display",upg:"Display CanSat boot time (from first ts packet)"},
+  {id:"10.3",pri:"standard",sec:"10 · FSM Tracking",cur:"No reset detection",upg:"Detect and display CanSat reset events (ts counter resets to 0)"},
+  {id:"11.1",pri:"standard",sec:"11 · UI/UX",cur:"Basic status indicator",upg:"Add mission clock (elapsed mission time)"},
+  {id:"11.2",pri:"standard",sec:"11 · UI/UX",cur:"No audio alerts",upg:"Add browser audio alert on anomaly detection / parachute deployment"},
+  {id:"11.3",pri:"standard",sec:"11 · UI/UX",cur:"No dark/light mode toggle",upg:"Add dark/light mode UI toggle"},
+  {id:"11.4",pri:"standard",sec:"11 · UI/UX",cur:"3D rocket rotates by accel data",upg:"Improve 3D model to show parachute deployment animation on ejection"},
+  {id:"11.5",pri:"standard",sec:"11 · UI/UX",cur:"No mobile support",upg:"Make dashboard responsive for tablet/mobile monitoring"},
+  {id:"12.1",pri:"standard",sec:"12 · Comms Test",cur:"No link budget display",upg:"Add link margin calculator panel (RSSI, distance, SNR display)"},
+  {id:"12.2",pri:"standard",sec:"12 · Comms Test",cur:"No range test log",upg:"Add range test logging mode — log RSSI/SNR vs distance"},
+  {id:"12.3",pri:"standard",sec:"12 · Comms Test",cur:"No packet loss metric",upg:"Display packet loss % in real time on status bar"},
+];
+
+const badgeCfg = {
+  critical: {cls:'b-critical', label:'🔴 Critical'},
+  high:     {cls:'b-high',     label:'🟡 High'},
+  standard: {cls:'b-standard', label:'🟢 Standard'},
+};
+
+let current = 'all';
+
+function render(data) {
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+  let lastSec = '';
+  data.forEach(r => {
+    if (r.sec !== lastSec) {
+      const sr = document.createElement('tr');
+      sr.className = 'sec-row';
+      sr.innerHTML = `<td colspan="5" style="padding: 10px 10px 4px;">${r.sec}</td>`;
+      tbody.appendChild(sr);
+      lastSec = r.sec;
+    }
+    const tr = document.createElement('tr');
+    const {cls, label} = badgeCfg[r.pri];
+    tr.innerHTML = `
+      <td class="dim">${r.id}</td>
+      <td><span class="badge ${cls}">${label}</span></td>
+      <td class="dim"></td>
+      <td>${r.cur}</td>
+      <td>${r.upg}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function filter(type, btn) {
+  current = type;
+  document.querySelectorAll('.pill').forEach(p => {
+    p.className = 'pill';
+  });
+  btn.className = `pill active-${type}`;
+  const filtered = type === 'all' ? rows : rows.filter(r => r.pri === type);
+  render(filtered);
+}
+
+render(rows);
+</script>

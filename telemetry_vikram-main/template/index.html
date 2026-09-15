@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Team Vikram — CanSat Telemetry</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap"
+        rel="stylesheet">
+    <link rel="icon" type="image/png" href="/assets/vikram-logo.png">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.1.0/dist/chartjs-plugin-annotation.min.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+
+<body>
+    <div class="atmosphere" aria-hidden="true"></div>
+    <div id="toastHost" class="toast-host" aria-live="polite"></div>
+    <div id="resetBanner" class="sys-banner sys-banner--warn" hidden>
+        <strong>CanSat reset detected</strong>
+        <span id="resetBannerText">Boot counter restarted — new session started.</span>
+        <button type="button" class="btn btn-ghost btn-xs" id="btnAckReset">Dismiss</button>
+    </div>
+    <div id="linkBanner" class="sys-banner sys-banner--alert" hidden>
+        <strong>Link lost</strong>
+        <span id="linkBannerText">No telemetry from server. Reconnecting…</span>
+        <span class="link-last" id="linkLastGood"></span>
+    </div>
+
+    <div class="wrap">
+
+        <!-- HEADER -->
+        <header class="hdr">
+            <div class="logo">
+                <img class="logo-img" src="/assets/vikram-logo.png" alt="VIKRAM" width="160" height="160">
+                <div class="logo-text">
+                    <p>CAN-7USAT · Mission Control</p>
+                </div>
+            </div>
+
+            <div class="hdr-mid">
+                <h2>Flight Parameters</h2>
+                <p>Telemetry · Navigation · Orientation</p>
+            </div>
+
+            <div class="hdr-right">
+                <div class="status-row">
+                    <div class="pill">
+                        <div class="dot" id="dotInd"></div>
+                        <span id="sText">DISCONNECTED</span>
+                    </div>
+                    <div class="counters">
+                        <div class="cnt"><span class="v" id="pkts">0</span><span class="l">PKT</span></div>
+                        <div class="cnt"><span class="v" id="dpts">0</span><span class="l">PTS</span></div>
+                        <div class="cnt"><span class="v cnt-clock" id="missionClock">00:00:00</span><span class="l">TIME</span></div>
+                    </div>
+                </div>
+                <div class="hdr-btn-row">
+                    <button id="btnDarkMode" class="btn btn-ghost" type="button">Dark</button>
+                    <button id="btnOpsMode" class="btn btn-ghost" type="button" title="Fullscreen ops mode (F)">Ops</button>
+                    <select id="comPortSelect" class="select-port" aria-label="COM port">
+                        <option value="">Select port</option>
+                    </select>
+                    <select id="sessionSelect" class="select-port" aria-label="Flight session">
+                        <option value="">Live session</option>
+                    </select>
+                    <button class="btn btn-ghost" id="btnExportCsv" type="button">CSV</button>
+                    <button class="btn btn-ghost" id="btnExportPdf" type="button">PDF Report</button>
+                    <button class="btn btn-inject" id="btnTest" type="button">Inject Test</button>
+                    <button class="btn btn-sim" id="btnSim" type="button">Simulate Flight</button>
+                </div>
+            </div>
+        </header>
+
+        <div class="mission-strip" id="missionStrip">
+            <div class="ms-item">
+                <span class="ms-l">Max Alt</span>
+                <span class="ms-v" id="sumMaxAlt">—</span>
+            </div>
+            <div class="ms-item">
+                <span class="ms-l">Max Speed</span>
+                <span class="ms-v" id="sumMaxSpd">—</span>
+            </div>
+            <div class="ms-item">
+                <span class="ms-l">Duration</span>
+                <span class="ms-v" id="sumDuration">—</span>
+            </div>
+            <div class="ms-item">
+                <span class="ms-l">Pkt Success</span>
+                <span class="ms-v" id="sumPktSuccess">—</span>
+            </div>
+            <div class="ms-item">
+                <span class="ms-l">Phase</span>
+                <span class="ms-v" id="sumPhase">—</span>
+            </div>
+            <div class="ms-item ms-spark">
+                <span class="ms-l">Packet Loss</span>
+                <canvas id="lossSpark" width="120" height="28" role="img" aria-label="Packet loss sparkline"></canvas>
+                <span class="ms-v ms-v-sm" id="sumPktLoss">0%</span>
+            </div>
+        </div>
+
+        <p class="kbd-hint" id="kbdHint">Keys: 1–8 tabs · T test · S simulate · F ops · D dark · Esc exit ops</p>
+
+        <!-- TABS -->
+        <nav class="tabs" role="tablist">
+            <div class="tab on" data-t="dashboard" role="tab">Dashboard</div>
+            <div class="tab" data-t="map" role="tab">Live Location</div>
+            <div class="tab" data-t="orientation" role="tab">3D Orientation</div>
+            <div class="tab" data-t="analysis" role="tab">AI Analysis</div>
+            <div class="tab" data-t="commands" role="tab">Commands</div>
+            <div class="tab" data-t="events" role="tab">Events</div>
+            <div class="tab" data-t="components" role="tab">Components</div>
+            <div class="tab" data-t="simulated" role="tab">Simulation</div>
+        </nav>
+
+        <!-- DASHBOARD -->
+        <div class="panel on" id="p-dashboard">
+            <div class="dash-layout">
+
+                <aside class="sidebar">
+                    <section class="card">
+                        <div class="ct">Live Telemetry</div>
+                        <div class="metric">
+                            <label>Mission Time</label>
+                            <span class="v" id="paramTime">--</span>
+                            <span class="u">seconds</span>
+                        </div>
+                        <div class="metric red">
+                            <label>Altitude</label>
+                            <span class="v" id="paramAlt">--</span>
+                            <span class="u">metres</span>
+                        </div>
+                        <div class="metric gold">
+                            <label>Accel Mag</label>
+                            <span class="v" id="paramAcc">--</span>
+                            <span class="u">g</span>
+                        </div>
+                        <div class="metric green">
+                            <label>Gyro Mag</label>
+                            <span class="v" id="paramGyr">--</span>
+                            <span class="u">°/s</span>
+                        </div>
+                    </section>
+
+                    <section class="card green">
+                        <div class="ct green">GPS / GNSS · NEO-7M</div>
+                        <div class="metric">
+                            <label>Latitude</label>
+                            <span class="v" id="sLat">--</span>
+                            <span class="u">°</span>
+                        </div>
+                        <div class="metric">
+                            <label>Longitude</label>
+                            <span class="v" id="sLon">--</span>
+                            <span class="u">°</span>
+                        </div>
+                        <div class="metric green">
+                            <label>GPS Alt</label>
+                            <span class="v" id="sGAlt">--</span>
+                            <span class="u">m</span>
+                        </div>
+                    </section>
+
+                    <section class="card">
+                        <div class="ct">Status Flags</div>
+                        <div class="badges">
+                            <span class="badge off" id="bLaunch">LAUNCHED: --</span>
+                            <span class="badge off" id="bEject">EJECTED: --</span>
+                        </div>
+                        <div class="detail-rows">
+                            <div class="detail-row"><span class="detail-row-label">Baro Alt</span><span id="dAlt" class="detail-row-value">--</span></div>
+                            <div class="detail-row"><span class="detail-row-label">Timestamp</span><span id="dTs" class="detail-row-value">--</span></div>
+                        </div>
+                    </section>
+
+                    <section class="card red">
+                        <div class="ct red">Angles · MPU6050</div>
+                        <div class="angle-rows">
+                            <div class="angle-row"><span class="angle-label">ROLL (X)</span><span id="rollA" class="angle-value">0.0°</span></div>
+                            <div class="angle-row"><span class="angle-label">PITCH (Y)</span><span id="pitchA" class="angle-value">0.0°</span></div>
+                            <div class="angle-row"><span class="angle-label">YAW (Z)</span><span id="yawA" class="angle-value">0.0°</span></div>
+                        </div>
+                    </section>
+                </aside>
+
+                <div class="dash-main">
+                <div class="charts-grid">
+                <section class="card chart-card">
+                    <div class="ct">Time vs Relative Velocity</div>
+                    <div class="ch"><canvas id="velChart"></canvas></div>
+                </section>
+                <section class="card red chart-card">
+                    <div class="ct red">Time vs Altitude</div>
+                    <div class="ch"><canvas id="altChart"></canvas></div>
+                </section>
+                <section class="card gold chart-card">
+                    <div class="ct gold">Time vs Temperature</div>
+                    <div class="ch"><canvas id="tempChart"></canvas></div>
+                </section>
+                <section class="card blue chart-card">
+                    <div class="ct blue">Time vs Pressure</div>
+                    <div class="ch"><canvas id="pressChart"></canvas></div>
+                </section>
+                </div>
+
+                <div class="kpi-grid">
+                <section class="card gold">
+                    <div class="ct gold">Environment · BMP/DHT</div>
+                    <div class="metric gold">
+                        <label>Temperature</label>
+                        <span class="v" id="paramTemp">--</span>
+                        <span class="u">°C</span>
+                    </div>
+                    <div class="metric gold">
+                        <label>Pressure</label>
+                        <span class="v" id="paramPress">--</span>
+                        <span class="u">hPa</span>
+                    </div>
+                    <div class="metric gold">
+                        <label>Humidity</label>
+                        <span class="v" id="paramHumid">--</span>
+                        <span class="u">%</span>
+                    </div>
+                </section>
+
+                <section class="card">
+                    <div class="ct">Power &amp; Comms</div>
+                    <div class="gauge-row">
+                        <div class="gauge" id="battGauge" data-label="Battery">
+                            <svg viewBox="0 0 80 80" class="gauge-svg">
+                                <circle class="gauge-track" cx="40" cy="40" r="30" />
+                                <circle class="gauge-arc" id="battArc" cx="40" cy="40" r="30" />
+                            </svg>
+                            <div class="gauge-readout">
+                                <span class="v" id="paramBatt">--</span>
+                                <span class="u">V</span>
+                            </div>
+                        </div>
+                        <div class="gauge gauge--rssi" id="rssiGauge" data-label="RSSI">
+                            <svg viewBox="0 0 80 80" class="gauge-svg">
+                                <circle class="gauge-track" cx="40" cy="40" r="30" />
+                                <circle class="gauge-arc" id="rssiArc" cx="40" cy="40" r="30" />
+                            </svg>
+                            <div class="gauge-readout">
+                                <span class="v" id="paramRssi">--</span>
+                                <span class="u">dBm</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="metric">
+                        <label>SNR</label>
+                        <span class="v" id="paramSnr">--</span>
+                        <span class="u">dB</span>
+                    </div>
+                </section>
+
+                <section class="card blue">
+                    <div class="ct blue">Flight State Machine</div>
+                    <div id="fsmState" class="fsm-state-display">--</div>
+                    <div class="fsm-flow">
+                        <div class="phase-flow-row">
+                            <span>Pre-Launch</span>
+                            <span class="phase-arrow">→</span>
+                            <span>Ascent</span>
+                        </div>
+                        <div class="phase-flow-row">
+                            <span>Ascent</span>
+                            <span class="phase-arrow">→</span>
+                            <span>Apogee</span>
+                        </div>
+                        <div class="phase-flow-row">
+                            <span>Apogee</span>
+                            <span class="phase-arrow">→</span>
+                            <span>Descent</span>
+                        </div>
+                        <div class="phase-flow-row">
+                            <span>Descent</span>
+                            <span class="phase-arrow">→</span>
+                            <span>Recovery</span>
+                        </div>
+                    </div>
+                </section>
+
+                </div>
+
+                <section class="card">
+                    <div class="ct gold">Detailed Sensor Readings</div>
+                    <table class="dtbl">
+                        <thead>
+                            <tr>
+                                <th>Sensor</th>
+                                <th>X</th>
+                                <th>Y</th>
+                                <th>Z</th>
+                                <th>Magnitude</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Acceleration (g)</td>
+                                <td class="n" id="ax">--</td>
+                                <td class="n" id="ay">--</td>
+                                <td class="n" id="az">--</td>
+                                <td class="m" id="aM">--</td>
+                            </tr>
+                            <tr>
+                                <td>Gyroscope (°/s)</td>
+                                <td class="n" id="gx">--</td>
+                                <td class="n" id="gy">--</td>
+                                <td class="n" id="gz">--</td>
+                                <td class="m" id="gM">--</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </section>
+                </div>
+            </div>
+
+            <div class="plot-row">
+            <section class="card chart-card">
+                <div class="ct green">Trajectory — Range vs Azimuth</div>
+                <div class="ch-tall"><canvas id="trajChart"></canvas></div>
+            </section>
+
+            <section class="card green chart-card">
+                <div class="ct green">Vertical Velocity / Descent Rate</div>
+                <div class="ch-tall"><canvas id="descentRateChart"></canvas></div>
+            </section>
+            </div>
+
+            <section class="card red">
+                <div class="ct red">Command &amp; Control · Uplink</div>
+                <div class="cmd-btn-row">
+                    <button class="btn btn-cmd btn-arm" id="btnArm" type="button">Arm System</button>
+                    <button class="btn btn-cmd btn-deploy" id="btnDeploy" type="button" disabled>Deploy Parachute</button>
+                    <button class="btn btn-cmd btn-abort" id="btnAbort" type="button" disabled>Abort Mission</button>
+                </div>
+                <div class="cmd-status-block">
+                    <div>Status: <span id="cmdStatus" class="cmd-val-gold">DISARMED</span></div>
+                    <div>Last Command: <span id="cmdLast" class="cmd-val-cyan">--</span></div>
+                    <div>Packet ID: <span id="cmdPacketId" class="cmd-val-cyan">--</span></div>
+                </div>
+            </section>
+        </div>
+
+        <!-- LIVE LOCATION -->
+        <div class="panel" id="p-map">
+            <section class="card green">
+                <div class="ct green ct-between">
+                    <span>Live Location — NEO-7M GNSS</span>
+                    <div class="map-ctrl-group">
+                        <label class="trail-toggle"><input type="checkbox" id="chkTrail" checked> Show Trail</label>
+                        <button class="btn btn-sim btn-sim-sm" id="btnSimMap" type="button">Simulate GPS</button>
+                        <button class="btn btn-clear-trail" id="btnClearTrail" type="button">Clear Trail</button>
+                    </div>
+                </div>
+
+                <div id="liveMap"></div>
+
+                <div class="map-bar">
+                    <div class="ms">
+                        <div class="v" id="mLat">--</div>
+                        <div class="l">Latitude</div>
+                    </div>
+                    <div class="ms">
+                        <div class="v" id="mLon">--</div>
+                        <div class="l">Longitude</div>
+                    </div>
+                    <div class="ms">
+                        <div class="v" id="mAlt">--</div>
+                        <div class="l">Altitude (m)</div>
+                    </div>
+                    <div class="ms">
+                        <div class="v" id="mSpd">--</div>
+                        <div class="l">Speed (m/s)</div>
+                    </div>
+                    <div class="ms">
+                        <div class="v" id="mHdg">--</div>
+                        <div class="l">Heading (°)</div>
+                    </div>
+                </div>
+
+                <div class="compass-wrap">
+                    <div>
+                        <div class="compass-label">HEADING</div>
+                        <div id="compass">
+                            <div class="compass-needle" id="needle"></div>
+                            <div class="compass-dir n">N</div>
+                            <div class="compass-dir s">S</div>
+                            <div class="compass-dir e">E</div>
+                            <div class="compass-dir w">W</div>
+                            <div class="compass-dot"></div>
+                        </div>
+                    </div>
+                    <div class="gps-extras">
+                        <div class="gps-row"><span>Fix Quality</span> <span id="gFix">GPS 3D</span></div>
+                        <div class="gps-row"><span>Satellites</span> <span id="gSat">--</span></div>
+                        <div class="gps-row"><span>HDOP</span> <span id="gHdop">--</span></div>
+                        <div class="gps-row"><span>Distance Trvl.</span> <span id="gDist">0 m</span></div>
+                        <div class="gps-row"><span>Max Altitude</span> <span id="gMaxAlt">-- m</span></div>
+                        <div class="gps-row"><span>Max Speed</span> <span id="gMaxSpd">-- m/s</span></div>
+                        <div class="gps-row"><span>Points Logged</span> <span id="gPts">0</span></div>
+                    </div>
+                </div>
+
+                <div class="map-note">
+                    Map auto-centres on GPS data from <strong class="note-cyan">NEO-7M GNSS</strong>.
+                    Trail = flight path. Marker = latest position.
+                    Telemetry should include <code class="note-gold">lat</code>, <code class="note-gold">lon</code>,
+                    <code class="note-gold">gps_alt</code>, <code class="note-gold">speed</code>, <code class="note-gold">heading</code>.
+                    Use <strong class="note-green">Simulate GPS</strong> without live hardware.
+                </div>
+            </section>
+        </div>
+
+        <!-- 3D ORIENTATION -->
+        <div class="panel" id="p-orientation">
+            <section class="card">
+                <div class="ct">3D Rocket Orientation — MPU6050</div>
+                <div id="rocketContainer">
+                    <canvas id="canvas3d"></canvas>
+                    <div class="ori">
+                        Roll (X): <span id="roR">0.0°</span><br>
+                        Pitch (Y): <span id="roP">0.0°</span><br>
+                        Yaw (Z): <span id="roY">0.0°</span>
+                    </div>
+                </div>
+
+                <section class="card nested chart-card">
+                    <div class="ct green">Altitude Profile — Distance Along Track</div>
+                    <div class="ch"><canvas id="altProfilChart"></canvas></div>
+                </section>
+            </section>
+        </div>
+
+        <!-- AI ANALYSIS -->
+        <div class="panel" id="p-analysis">
+            <section class="card gold">
+                <div class="ct gold ct-ai">
+                    <span>AI Flight Analysis</span>
+                    <button class="btn btn-ai" id="btnAi" type="button">Generate Live Report</button>
+                </div>
+                <div class="ai-box" id="aiOut">Waiting for telemetry data… Click Generate Live Report for aeronautical insights.</div>
+            </section>
+
+            <section class="card red">
+                <div class="ct red">Flight State Machine</div>
+                <div id="fsmState2" class="fsm-state-display-lg">IDLE</div>
+                <div class="fsm-flow">
+                    <div>States: IDLE → ARMED → ASCENDING → COASTING → DESCENDING → EJECTED → LANDED</div>
+                </div>
+            </section>
+
+            <section class="card">
+                <div class="ct">Anomaly Timeline</div>
+                <div id="anomalyTimeline" class="anomaly-container">
+                    <div class="empty-msg">No anomalies detected</div>
+                </div>
+            </section>
+
+            <section class="card green">
+                <div class="ct green">Link Margin Analysis</div>
+                <div class="link-margin-grid">
+                    <div class="link-metric">
+                        <div class="link-metric-label">Path Loss</div>
+                        <div class="link-metric-value"><span id="pathLoss">-- dB</span></div>
+                    </div>
+                    <div class="link-metric">
+                        <div class="link-metric-label">Link Margin</div>
+                        <div class="link-metric-value"><span id="linkMargin">-- dB</span></div>
+                    </div>
+                    <div class="link-metric">
+                        <div class="link-metric-label">Packet Loss</div>
+                        <div class="link-metric-value"><span id="packetLoss">0%</span></div>
+                    </div>
+                    <div class="link-metric">
+                        <div class="link-metric-label">SNR Quality</div>
+                        <div class="link-metric-value"><span id="snrQuality">--</span></div>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <!-- COMMANDS -->
+        <div class="panel" id="p-commands">
+            <section class="card gold">
+                <div class="ct gold">Command History</div>
+                <div class="panel-ctrl-row">
+                    <button class="btn" id="btnRefreshCmdLog" type="button">Refresh</button>
+                    <select id="cmdFilter" class="form-select" title="Filter command history" aria-label="Filter command history">
+                        <option value="">All Commands</option>
+                        <option value="ARM">ARM Only</option>
+                        <option value="DEPLOY">DEPLOY Only</option>
+                        <option value="ABORT">ABORT Only</option>
+                    </select>
+                </div>
+                <div id="cmdLog" class="log-scroll">
+                    <div class="empty-msg">Loading commands…</div>
+                </div>
+            </section>
+        </div>
+
+        <!-- EVENTS -->
+        <div class="panel" id="p-events">
+            <section class="card green">
+                <div class="ct green">Mission Event Log</div>
+                <div class="panel-ctrl-row">
+                    <button class="btn" id="btnRefreshEvents" type="button">Refresh</button>
+                    <select id="eventFilter" class="form-select form-select--green" title="Filter mission events" aria-label="Filter mission events">
+                        <option value="">All Events</option>
+                        <option value="LAUNCH">LAUNCH</option>
+                        <option value="APOGEE">APOGEE</option>
+                        <option value="EJECTION">EJECTION</option>
+                        <option value="LAND">LANDING</option>
+                    </select>
+                </div>
+                <div id="eventLog" class="log-scroll">
+                    <div class="empty-msg">Loading events…</div>
+                </div>
+            </section>
+
+            <section class="card">
+                <div class="ct">Create Event</div>
+                <div class="create-event-form">
+                    <select id="eventType" class="form-select" title="Select event type" aria-label="Select event type">
+                        <option value="LAUNCH">Launch</option>
+                        <option value="APOGEE">Apogee Detected</option>
+                        <option value="EJECTION">Parachute Ejection</option>
+                        <option value="LAND">Landing</option>
+                        <option value="MANUAL">Manual Entry</option>
+                    </select>
+                    <input id="eventNote" type="text" placeholder="Note (optional)" class="form-input">
+                    <button class="btn" id="btnCreateEvent" type="button">Log Event</button>
+                </div>
+            </section>
+        </div>
+
+        <!-- COMPONENTS -->
+        <div class="panel" id="p-components">
+            <div class="comp-grid">
+                <section class="card gold">
+                    <div class="ct gold">Base Station Components</div>
+                    <div class="comp-item"><span class="cn">Microcontroller</span><span class="cm">ESP32-M Glyph C6</span><span class="cw">3g</span></div>
+                    <div class="comp-item"><span class="cn">Antenna</span><span class="cm">Yagi-Uda (custom)</span><span class="cw">—</span></div>
+                    <div class="comp-item"><span class="cn">Comm Module</span><span class="cm">LoRa SX-1278</span><span class="cw">5g</span></div>
+                    <div class="comp-item"><span class="cn">Display</span><span class="cm">1.3″ OLED</span><span class="cw">6g</span></div>
+                    <div class="comp-item"><span class="cn">Nav Buttons</span><span class="cm">OLED control</span><span class="cw">2g</span></div>
+                    <div class="comp-item"><span class="cn">Battery</span><span class="cm">Li-ion Rechargeable</span><span class="cw">45g</span></div>
+                    <div class="comp-item"><span class="cn">Battery Holder</span><span class="cm">—</span><span class="cw">10g</span></div>
+                    <div class="comp-item"><span class="cn">Buck Converter</span><span class="cm">Voltage Regulator</span><span class="cw">10g</span></div>
+                </section>
+                <section class="card">
+                    <div class="ct">CanSat Components</div>
+                    <div class="comp-item"><span class="cn">Servo Motors</span><span class="cm">Camera + Parachute</span><span class="cw">20g</span></div>
+                    <div class="comp-item"><span class="cn">Camera</span><span class="cm">Seeed ESP32-CAM</span><span class="cw">10g</span></div>
+                    <div class="comp-item"><span class="cn">Buck Converter</span><span class="cm">Onboard Reg</span><span class="cw">5g</span></div>
+                    <div class="comp-item"><span class="cn">Battery</span><span class="cm">Portable Li-Po</span><span class="cw">25g</span></div>
+                    <div class="comp-item"><span class="cn">Temp/Humidity</span><span class="cm">DHT11</span><span class="cw">1g</span></div>
+                    <div class="comp-item"><span class="cn">Altitude</span><span class="cm">BMP380</span><span class="cw">0.6g</span></div>
+                    <div class="comp-item"><span class="cn">IMU</span><span class="cm">MPU6050</span><span class="cw">1g</span></div>
+                    <div class="comp-item"><span class="cn">Power Monitor</span><span class="cm">INA219</span><span class="cw">1g</span></div>
+                    <div class="comp-item"><span class="cn">GNSS</span><span class="cm">NEO-7M GPS</span><span class="cw">5g</span></div>
+                    <div class="comp-item"><span class="cn">Gas Sensors</span><span class="cm">MQ135 / MQ2 / MQ7</span><span class="cw">21g</span></div>
+                    <div class="comp-item"><span class="cn">Vibration</span><span class="cm">SW-420</span><span class="cw">2g</span></div>
+                    <div class="comp-item"><span class="cn">LoRa Comm</span><span class="cm">SX-1278</span><span class="cw">5g</span></div>
+                    <div class="comp-item"><span class="cn">PCB</span><span class="cm">Custom PCB</span><span class="cw">25g</span></div>
+                    <div class="comp-item"><span class="cn">MCU</span><span class="cm">ESP32-M Glyph C6</span><span class="cw">3g</span></div>
+                    <div class="comp-item"><span class="cn">Whip Antenna</span><span class="cm">240 mm</span><span class="cw">—</span></div>
+                    <div class="comp-item"><span class="cn">SMA Connector</span><span class="cm">—</span><span class="cw">2g</span></div>
+                </section>
+            </div>
+        </div>
+
+        <!-- SIMULATED -->
+        <div class="panel" id="p-simulated">
+            <section class="card">
+                <div class="ct">Simulated Output</div>
+                <div id="simOut">
+                    <div class="sim-placeholder">Scanning for simulated outputs…</div>
+                </div>
+            </section>
+        </div>
+
+    </div>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
