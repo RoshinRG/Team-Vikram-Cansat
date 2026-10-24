@@ -1,7 +1,9 @@
-flask
-flask-cors
-pyserial
-openai
-python-dotenv
-opencv-python
-requests
+flask>=3.0,<4
+flask-cors>=4
+pyserial>=3.5
+python-dotenv>=1.0
+opencv-python>=4.8
+requests>=2.31
+pandas>=2.0
+fpdf2>=2.7
+openai>=1.0

@@ -1,0 +1,17 @@
+CompileFlags:
+  Add:
+    - -xc++
+    - -std=c++17
+    - -ferror-limit=0
+
+---
+If:
+  PathMatch: .*\.ino.*
+Diagnostics:
+  Suppress: '*'
+
+---
+If:
+  PathMatch: .*hardware code.*
+Diagnostics:
+  Suppress: '*'
