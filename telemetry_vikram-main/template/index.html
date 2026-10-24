@@ -12,13 +12,16 @@
         href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap"
         rel="stylesheet">
     <link rel="icon" type="image/png" href="/assets/vikram-logo.png">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="/vendor/leaflet.css" onerror="this.onerror=null;this.href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';">
     <link rel="stylesheet" href="style.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.1.0/dist/chartjs-plugin-annotation.min.js"></script>
-    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/vendor/chart.umd.js"></script>
+    <script>if (typeof Chart === 'undefined') document.write('<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"><\/script>');</script>
+    <script src="/vendor/chartjs-plugin-annotation.min.js"></script>
+    <script src="/vendor/three.min.js"></script>
+    <script>if (typeof THREE === 'undefined') document.write('<script src="https://unpkg.com/three@0.128.0/build/three.min.js"><\/script>');</script>
+    <script src="/vendor/STLLoader.js"></script>
+    <script src="/vendor/leaflet.js"></script>
+    <script>if (typeof L === 'undefined') document.write('<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>');</script>
 </head>
 
 <body>
@@ -66,16 +69,17 @@
                 <div class="hdr-btn-row">
                     <button id="btnDarkMode" class="btn btn-ghost" type="button">Dark</button>
                     <button id="btnOpsMode" class="btn btn-ghost" type="button" title="Fullscreen ops mode (F)">Ops</button>
-                    <select id="comPortSelect" class="select-port" aria-label="COM port">
+                    <select id="comPortSelect" class="select-port" title="Select COM port" aria-label="COM port">
                         <option value="">Select port</option>
                     </select>
-                    <select id="sessionSelect" class="select-port" aria-label="Flight session">
+                    <select id="sessionSelect" class="select-port" title="Select flight session" aria-label="Flight session">
                         <option value="">Live session</option>
                     </select>
                     <button class="btn btn-ghost" id="btnExportCsv" type="button">CSV</button>
                     <button class="btn btn-ghost" id="btnExportPdf" type="button">PDF Report</button>
                     <button class="btn btn-inject" id="btnTest" type="button">Inject Test</button>
                     <button class="btn btn-sim" id="btnSim" type="button">Simulate Flight</button>
+                    <button class="btn btn-ghost" id="btnClearData" type="button" title="Clear all telemetry and start fresh">Clear Data</button>
                 </div>
             </div>
         </header>
@@ -120,7 +124,7 @@
             <div class="tab" data-t="events" role="tab">Events</div>
             <div class="tab" data-t="components" role="tab">Components</div>
             <div class="tab" data-t="simulated" role="tab">Simulation</div>
-            <div class="tab" data-t="video" role="tab">📷 Live Feed</div>
+            <div class="tab" data-t="video" role="tab">📷 Feed</div>
         </nav>
 
         <!-- DASHBOARD -->
@@ -231,6 +235,11 @@
                         <span class="v" id="paramHumid">--</span>
                         <span class="u">%</span>
                     </div>
+                    <div class="metric gold">
+                        <label>Air Quality (MQ135)</label>
+                        <span class="v" id="paramGas">--</span>
+                        <span class="u">raw ADC</span>
+                    </div>
                 </section>
 
                 <section class="card">
@@ -256,6 +265,11 @@
                                 <span class="u">dBm</span>
                             </div>
                         </div>
+                    </div>
+                    <div class="metric">
+                        <label>Current Draw (INA219)</label>
+                        <span class="v" id="paramCurr">--</span>
+                        <span class="u">mA</span>
                     </div>
                     <div class="metric">
                         <label>SNR</label>
@@ -359,7 +373,7 @@
                 <div class="ct green ct-between">
                     <span>Live Location — NEO-7M GNSS</span>
                     <div class="map-ctrl-group">
-                        <label class="trail-toggle"><input type="checkbox" id="chkTrail" checked> Show Trail</label>
+                        <label class="trail-toggle"><input type="checkbox" id="chkTrail" checked title="Show GPS flight trail" aria-label="Show GPS flight trail"> Show Trail</label>
                         <button class="btn btn-sim btn-sim-sm" id="btnSimMap" type="button">Simulate GPS</button>
                         <button class="btn btn-clear-trail" id="btnClearTrail" type="button">Clear Trail</button>
                     </div>
@@ -447,7 +461,7 @@
         <div class="panel" id="p-analysis">
             <section class="card gold">
                 <div class="ct gold ct-ai">
-                    <span>AI Flight Analysis</span>
+                    <span>AI Flight Analysis (local)</span>
                     <button class="btn btn-ai" id="btnAi" type="button">Generate Live Report</button>
                 </div>
                 <div class="ai-box" id="aiOut">Waiting for telemetry data… Click Generate Live Report for aeronautical insights.</div>
@@ -591,27 +605,24 @@
             </section>
         </div>
 
-    </div>
-
         <!-- VIDEO FEED -->
         <div class="panel" id="p-video">
             <section class="card">
                 <div class="video-card-hdr">
-                    <div class="ct">📷 Live Camera Feed</div>
+                    <div class="ct">📷 Camera Feed</div>
                     <div class="video-controls">
                         <button class="btn btn-ghost btn-xs" id="btnVidUSB" type="button" title="Switch to local USB webcam">USB Cam</button>
                         <button class="btn btn-ghost btn-xs" id="btnVidESP" type="button" title="Switch to ESP32-CAM stream">ESP32-CAM</button>
                         <button class="btn btn-ghost btn-xs" id="btnVidSnap" type="button" title="Download snapshot">⬇ Snap</button>
-                        <span id="vidBadge" class="badge-live">LIVE</span>
                     </div>
                 </div>
 
                 <div class="video-wrapper">
-                    <img id="liveFeed"
+                    <img id="Feed"
                          src="/video_feed"
-                         alt="Live camera feed"
+                         alt="camera feed"
                          onerror="handleVideoError()"
-                         onload="handleVideoLoad()" />
+                         onload="handleVideoLoad()">
                     <div id="vidOverlay" class="vid-offline hidden">📡 No Signal</div>
                 </div>
 

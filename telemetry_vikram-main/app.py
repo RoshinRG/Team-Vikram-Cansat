@@ -1,7 +1,7 @@
 import pkgutil
 import importlib.util
 # pyrefly: ignore [missing-import]
-from flask import Flask, jsonify, render_template, send_file, request, Response, stream_with_context
+from flask import Flask, jsonify, render_template, send_file, request, Response, stream_with_context, redirect
 from flask_cors import CORS
 import serial
 import serial.tools.list_ports
@@ -22,6 +22,21 @@ try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
+
+try:
+    from flight_analysis import (
+        PROVIDER as FLIGHT_ML_PROVIDER,
+        build_report as build_flight_report,
+        generate_pdf_bytes as build_flight_pdf,
+        save_pdf as save_flight_pdf,
+        FPDF as _FPDF,
+    )
+except ImportError:
+    FLIGHT_ML_PROVIDER = "vikram-flight-ml"
+    build_flight_report = None
+    build_flight_pdf = None
+    save_flight_pdf = None
+    _FPDF = None
 
 # ── Video-streaming deps (optional — server still runs without them) ──
 try:
@@ -56,23 +71,59 @@ MAX_FLIGHT_PACKETS = int(os.getenv("MAX_FLIGHT_PACKETS", "5000"))
 # Continuous AI analysis interval (seconds)
 AI_ANALYSIS_INTERVAL = int(os.getenv("AI_ANALYSIS_INTERVAL", "15"))
 # Minimum packets before AI fires
-AI_MIN_PACKETS       = int(os.getenv("AI_MIN_PACKETS", "10"))
+AI_MIN_PACKETS       = int(os.getenv("AI_MIN_PACKETS", "5"))
 
-# ================= AI CONFIG =================
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-ai_client  = None
-if NVIDIA_API_KEY and OpenAI:
-    ai_client = OpenAI(
-        api_key=NVIDIA_API_KEY,
-        base_url="https://integrate.api.nvidia.com/v1",
-    )
-elif NVIDIA_API_KEY and not OpenAI:
-    print("⚠️  WARNING: openai package not installed — AI analysis disabled")
+# ================= NEW HARDWARE THRESHOLDS =================
+# Thresholds for deriving launched/ejected flags from new compact-format packets.
+# GUESS: launched when acceleration magnitude > 3 g OR altitude > 5 m.
+#        ejected  when relay pin goes HIGH after launch (relay=1 post-launch).
+# Adjust after reviewing the CanSat circuit — relay usage may differ.
+LAUNCH_ACCEL_THRESHOLD_G = float(os.getenv("LAUNCH_ACCEL_THRESHOLD_G", "3.0"))  # g
+LAUNCH_ALT_THRESHOLD_M   = float(os.getenv("LAUNCH_ALT_THRESHOLD_M",   "5.0"))  # metres
+
+# Receiver heartbeat / link timeouts (seconds)
+RX_ONLINE_TIMEOUT_S  = float(os.getenv("RX_ONLINE_TIMEOUT_S",  "5.0"))
+LINK_TIMEOUT_S       = float(os.getenv("LINK_TIMEOUT_S",       "10.0"))
+
+# ================= WIFI RECEIVER STATE =================
+# Tracks state for the new compact-format ("n" key) packet path.
+_wifi_rx_state: dict = {
+    "last_rx_poll_t":   None,   # time of last GET /api/commands call
+    "last_packet_t":    None,   # time of last accepted POST /api/telemetry
+    "lost":             0,      # estimated lost packets from sequence gaps
+    "bad":              0,      # packets rejected (no "n" key or malformed)
+    "last_seq":         None,   # last received sequence number
+    "session_start_t":  None,   # server time of first packet in current session
+    "session_launched": False,  # derived launched flag, sticky per session
+    "session_ejected":  False,  # derived ejected flag, sticky per session
+}
+# Pending uplink commands for the receiver to collect on GET /api/commands.
+_uplink_queue: list = []
+_uplink_lock  = threading.Lock()
+
+# ================= AI CONFIG (NVIDIA Nemotron-3 Ultra 550b) =================
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "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")
+NVIDIA_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+ai_client = None
+
+if OpenAI and NVIDIA_API_KEY:
+    try:
+        ai_client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=NVIDIA_API_KEY,
+        )
+        print(f"🤖 AI analysis: NVIDIA Nemotron-3 Ultra 550b ({NVIDIA_MODEL})")
+    except Exception as e:
+        print(f"⚠️  Error initializing NVIDIA OpenAI client: {e}")
+elif not OpenAI:
+    print("⚠️  WARNING: openai package not installed — falling back to local flight analysis")
 else:
-    print("⚠️  WARNING: NVIDIA_API_KEY not found in .env — AI analysis disabled")
+    print("⚠️  WARNING: NVIDIA_API_KEY not set — falling back to local flight analysis")
 
 # ================= APP =================
 app = Flask(__name__, template_folder='template', static_folder='template', static_url_path='', root_path=os.path.dirname(__file__))
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.jinja_env.auto_reload = True
 
 # Shared ground-station token for state-changing routes (override via GS_TOKEN).
 GS_TOKEN = os.getenv("GS_TOKEN", "vikram-gs-local")
@@ -109,6 +160,7 @@ ANOMALY_THROTTLE_S = 5.0
 # Cached AI result
 ai_cache: dict = {
     "analysis":   None,
+    "reasoning":  None,
     "timestamp":  None,
     "provider":   None,
     "phase":      None,
@@ -151,8 +203,16 @@ def init_db():
                 launched    BOOLEAN,
                 ejected     BOOLEAN,
                 sim         BOOLEAN,
+                flight_phase TEXT,
                 raw_json    TEXT,
-                received_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                temp_dht    REAL,
+                mq135       REAL,
+                current_ma  REAL,
+                gps_alt     REAL,
+                sats        INTEGER,
+                relay       INTEGER,
+                servo       INTEGER
             )
         ''')
     else:
@@ -177,8 +237,17 @@ def init_db():
             ("launched", "BOOLEAN"),
             ("ejected", "BOOLEAN"),
             ("sim", "BOOLEAN"),
+            ("flight_phase", "TEXT"),
             ("raw_json", "TEXT"),
-            ("received_at", "DATETIME DEFAULT CURRENT_TIMESTAMP")
+            ("received_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
+            # ── New columns for compact-format hardware ────────────────
+            ("temp_dht",   "REAL"),
+            ("mq135",      "REAL"),
+            ("current_ma", "REAL"),
+            ("gps_alt",    "REAL"),
+            ("sats",       "INTEGER"),
+            ("relay",      "INTEGER"),
+            ("servo",      "INTEGER"),
         ]
 
         for name, definition in missing_columns:
@@ -272,6 +341,19 @@ def init_db():
         )
     ''')
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_commands_session ON commands(session_id)")
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS range_samples (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT,
+            packet_id   INTEGER,
+            rssi        REAL,
+            snr         REAL,
+            distance_m  REAL,
+            logged_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_range_session ON range_samples(session_id)")
     
     conn.commit()
     conn.close()
@@ -289,6 +371,28 @@ def _sanitise_float(val, default=0.0):
         return round(f, 6)
     except (TypeError, ValueError):
         return default
+
+
+def _num(val, default=0.0):
+    """Coerce None/invalid sensor values to a numeric default for comparisons."""
+    if val is None:
+        return default
+    try:
+        f = float(val)
+        if f != f:
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
+def _fmt_sensor(val, spec=".2f"):
+    if val is None:
+        return "n/a"
+    try:
+        return format(float(val), spec)
+    except (TypeError, ValueError):
+        return "n/a"
 
 
 def _sanitise_int(val, default=0):
@@ -340,12 +444,21 @@ def _new_track_state():
     }
 
 
+_last_gps_fix: dict = {}
+_track_state: dict = _new_track_state()
+_last_logged_phase: str = "PRE-LAUNCH"
+_auto_exported_sessions: set = set()
+_session_boot_ts = None
+
+
 def _attach_track_fields(data: dict, state: dict) -> dict:
     """Stamp cumulative distance-along-track (m), track_source, and v_z on a packet.
 
     GPS gaps do not haversine across the dropout (that would fabricate range).
     During a gap, distance is held unless ground speed is available (labeled estimated).
     """
+    if "dist" not in state:
+        state.update(_new_track_state())
     lat, lon = data.get("lat"), data.get("lon")
     ts = data.get("ts") or 0
     gps_ok = lat is not None and lon is not None
@@ -363,7 +476,7 @@ def _attach_track_fields(data: dict, state: dict) -> dict:
     else:
         dt = ((ts - state["ts"]) / 1000.0) if state.get("ts") is not None else 0.0
         spd = data.get("speed") or 0.0
-        if state["had_gps"] and dt > 0 and spd > 0:
+        if state.get("had_gps") and dt > 0 and spd > 0:
             state["dist"] += float(spd) * dt
             data["track_source"] = "estimated"
         else:
@@ -373,19 +486,21 @@ def _attach_track_fields(data: dict, state: dict) -> dict:
 
     data["distance_along_track"] = round(state["dist"], 3)
 
-    if state.get("alt") is not None and state.get("alt_ts") is not None:
+    alt = data.get("alt")
+    if state.get("alt") is not None and alt is not None and state.get("alt_ts") is not None:
         dt_alt = (ts - state["alt_ts"]) / 1000.0
-        data["v_z"] = round((data.get("alt", 0) - state["alt"]) / dt_alt, 4) if dt_alt > 0 else 0.0
+        data["v_z"] = round((alt - state["alt"]) / dt_alt, 4) if dt_alt > 0 else 0.0
     else:
         data["v_z"] = 0.0
-    state["alt"] = data.get("alt", 0)
-    state["alt_ts"] = ts
+    if alt is not None:
+        state["alt"] = alt
+        state["alt_ts"] = ts
     state["ts"] = ts
     return state
 
 
 def _sanitise_packet(data: dict) -> dict:
-    """Validate and sanitise a raw telemetry packet."""
+    """Validate and sanitise a raw telemetry packet (old / pre-normalised format)."""
     lat = _sanitise_gps(data.get("lat", data.get("latitude")))
     lon = _sanitise_gps(data.get("lon", data.get("longitude")))
     if lat is not None and lon is not None and abs(lat) < 1e-8 and abs(lon) < 1e-8:
@@ -415,7 +530,288 @@ def _sanitise_packet(data: dict) -> dict:
         "launched": bool(data.get("launched", False)),
         "ejected":  bool(data.get("ejected",  False)),
         "sim":      bool(data.get("sim",      False)),
+        # new columns — kept as-is from old format (None when missing)
+        "temp_dht":  _sanitise_optional_float(data.get("temp_dht")),
+        "mq135":     _sanitise_optional_float(data.get("mq135")),
+        "current_ma":_sanitise_optional_float(data.get("current_ma")),
+        "gps_alt":   _sanitise_optional_float(data.get("gps_alt")),
+        "sats":      int(data.get("sats")) if data.get("sats") is not None else None,
+        "relay":     int(data.get("relay")) if data.get("relay") is not None else None,
+        "servo":     int(data.get("servo")) if data.get("servo") is not None else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# NEW-FORMAT ADAPTER  (compact keys from E220 / Glyph C6 WiFi receiver)
+# ---------------------------------------------------------------------------
+# Field mapping: compact key -> normalised key, conversion note
+#  n    -> packet_id (as is)
+#  a    -> alt        (metres, as is)
+#  bt   -> temp       (BMP180 °C; fallback: dt DHT temp)
+#  p    -> pressure   (Pa, as is)
+#  h    -> humidity   (%, as is)
+#  ax..az -> ax..az  (m/s² -> g: divide by 9.80665)
+#  gx..gz -> gx..gz  (rad/s -> °/s: multiply by 57.29578)
+#  la   -> lat        GPS latitude (as is, absent when no fix)
+#  lo   -> lon        GPS longitude (as is, absent when no fix)
+#  v    -> batt_v     INA219 bus voltage (GUESS: this maps to batt_v)
+#  dt   -> temp_dht   (new column)
+#  mq   -> mq135      (new column)
+#  i    -> current_ma (new column)
+#  ga   -> gps_alt    (new column)
+#  s    -> sats       (new column)
+#  r    -> relay      (new column)
+#  sv   -> servo      (new column)
+# rssi, snr are NOT available from E220 in transparent mode -> left as None.
+
+_G        = 9.80665
+_RAD2DEG  = 57.29577951308232
+
+
+def _adapt_new_format(raw: dict) -> dict:
+    """Convert compact-key new-hardware packet to the normalised format.
+
+    Rules:
+    - Never invent sensor values: if a key is absent the normalised key is None.
+    - rssi / snr are always None (E220 transparent mode gives no RSSI to the host).
+    - Accelerations arrive in m/s²; divide by g to get g-force.
+    - Gyro arrives in rad/s; multiply by 57.296 to get °/s.
+    - lat/lon absent when no GPS fix (firmware omits them).
+    """
+    normed: dict = {}
+
+    # Sequence -> packet_id
+    normed["packet_id"] = int(raw["n"])
+
+    # Altitude (metres above pad)
+    normed["alt"] = _sanitise_optional_float(raw.get("a"))  # None if BMP absent
+
+    # Temperature: BMP180 preferred, DHT fallback
+    bt = _sanitise_optional_float(raw.get("bt"))
+    dt_val = _sanitise_optional_float(raw.get("dt"))
+    normed["temp"] = bt if bt is not None else dt_val   # None when both absent
+
+    # Pressure (Pa)
+    normed["pressure"] = _sanitise_optional_float(raw.get("p"))
+
+    # Humidity (%)
+    normed["humidity"] = _sanitise_optional_float(raw.get("h"))
+
+    # Accelerations: m/s² -> g
+    def _acc(k):
+        v = _sanitise_optional_float(raw.get(k))
+        return round(v / _G, 6) if v is not None else None
+
+    normed["ax"] = _acc("ax")
+    normed["ay"] = _acc("ay")
+    normed["az"] = _acc("az")
+
+    # Gyro: rad/s -> °/s
+    def _gyr(k):
+        v = _sanitise_optional_float(raw.get(k))
+        return round(v * _RAD2DEG, 6) if v is not None else None
+
+    normed["gx"] = _gyr("gx")
+    normed["gy"] = _gyr("gy")
+    normed["gz"] = _gyr("gz")
+
+    # GPS (absent when no fix; firmware omits la/lo when invalid)
+    lat = _sanitise_gps(raw.get("la"))
+    lon = _sanitise_gps(raw.get("lo"))
+    # reject (0, 0) as invalid
+    if lat is not None and lon is not None and abs(lat) < 1e-8 and abs(lon) < 1e-8:
+        lat, lon = None, None
+    normed["lat"] = lat
+    normed["lon"] = lon
+
+    # Power — bus voltage (GUESS: INA219 "v" maps to batt_v)
+    normed["batt_v"] = _sanitise_optional_float(raw.get("v"))
+
+    # No RSSI/SNR from E220 transparent mode
+    normed["rssi"] = None
+    normed["snr"]  = None
+
+    # New-format extra channels
+    normed["temp_dht"]   = dt_val
+    normed["mq135"]      = _sanitise_optional_float(raw.get("mq"))
+    normed["current_ma"] = _sanitise_optional_float(raw.get("i"))
+    normed["gps_alt"]    = _sanitise_optional_float(raw.get("ga"))
+    s_val = raw.get("s")
+    normed["sats"]  = int(s_val)  if s_val is not None else None
+    r_val = raw.get("r")
+    normed["relay"] = int(r_val)  if r_val is not None else None
+    sv_val = raw.get("sv")
+    normed["servo"] = int(sv_val) if sv_val is not None else None
+
+    normed["sim"] = False
+    return normed
+
+
+def ingest_packet(raw: dict, source: str = "serial") -> dict | None:
+    """Central entry point for ALL incoming telemetry packets.
+
+    Accepts both:
+      - Old format: has 'alt', 'ax'... already normalised.
+      - New compact format: has 'n'; converted via _adapt_new_format().
+
+    Returns the normalised data dict (already placed into flight_data /
+    latest_data) or None if the packet was rejected.
+    """
+    global current_session_id, last_ts_value, data_version
+    global _last_logged_phase, _session_boot_ts
+
+    is_new_format = "n" in raw and "alt" not in raw
+
+    if is_new_format:
+        # ---- NEW COMPACT FORMAT ----------------------------------------
+        try:
+            normed = _adapt_new_format(raw)
+        except Exception as e:
+            print(f"⚠️  Compact-format adapt error: {e}  raw={raw}")
+            with _uplink_lock:
+                _wifi_rx_state["bad"] += 1
+            return None
+
+        seq = normed["packet_id"]
+
+        with _uplink_lock:
+            last_seq = _wifi_rx_state["last_seq"]
+            now_t    = time.time()
+
+            # Reset detection: sequence went backwards (reboot), not a duplicate packet
+            seq_restarted = (
+                last_seq is not None
+                and seq < last_seq
+                and (seq < 5 or (last_seq - seq) > 20)
+            )
+            if seq_restarted:
+                print(f"🔄 RESET DETECTED (compact): seq {last_seq} -> {seq} — new session")
+                new_sid = f"session_{int(now_t)}"
+                current_session_id = new_sid
+                _wifi_rx_state["session_launched"] = False
+                _wifi_rx_state["session_ejected"]  = False
+                _wifi_rx_state["session_start_t"]  = now_t
+                _last_logged_phase = "PRE-LAUNCH"
+                _session_boot_ts = None
+                with _lock:
+                    _track_state.clear()
+                    _track_state.update(_new_track_state())
+                    _last_gps_fix.clear()
+                    reset_info.update({
+                        "detected": True, "at": now_t,
+                        "from_ts": last_seq, "to_ts": seq,
+                        "session_id": new_sid,
+                    })
+            elif _wifi_rx_state["session_start_t"] is None:
+                _wifi_rx_state["session_start_t"] = now_t
+
+            # Packet loss from sequence gaps
+            if last_seq is not None and seq > last_seq + 1:
+                _wifi_rx_state["lost"] += seq - last_seq - 1
+
+            _wifi_rx_state["last_seq"]      = seq
+            _wifi_rx_state["last_packet_t"] = now_t
+
+            # Mission time = seconds since session's first packet
+            session_start = _wifi_rx_state.get("session_start_t") or now_t
+            mission_time  = round(now_t - session_start, 3)
+
+            # Derive launched / ejected flags (sticky per session)
+            ax_g = _num(normed.get("ax"))
+            ay_g = _num(normed.get("ay"))
+            az_g = _num(normed.get("az"))
+            accel_mag = math.sqrt(ax_g**2 + ay_g**2 + az_g**2)
+            alt_m = _num(normed.get("alt"))
+            if not _wifi_rx_state["session_launched"]:
+                if accel_mag > LAUNCH_ACCEL_THRESHOLD_G or alt_m > LAUNCH_ALT_THRESHOLD_M:
+                    _wifi_rx_state["session_launched"] = True
+                    print(f"🚀 LAUNCHED detected (accel={accel_mag:.2f}g, alt={alt_m:.1f}m)")
+            if _wifi_rx_state["session_launched"] and not _wifi_rx_state["session_ejected"]:
+                if normed.get("relay") == 1:
+                    _wifi_rx_state["session_ejected"] = True
+                    print(f"🪂 EJECTED detected (relay=1 after launch)")
+
+            normed["launched"] = _wifi_rx_state["session_launched"]
+            normed["ejected"]  = _wifi_rx_state["session_ejected"]
+
+        # Stamp server-side ts (ms) and mission_time
+        normed["ts"]           = int(time.time() * 1000)
+        normed["mission_time"] = mission_time
+        normed["session_id"]   = current_session_id
+        normed["speed"]        = None  # will be computed below if GPS present
+
+    else:
+        # ---- OLD / PRE-NORMALISED FORMAT (serial, test-data, etc.) -----
+        normed = _sanitise_packet(raw)
+        normed["session_id"] = current_session_id
+
+        # Legacy reset detection via ts counter
+        current_ts = normed.get("ts", 0)
+        if last_ts_value > 10000 and current_ts < 1000:
+            print(f"🔄 RESET DETECTED (serial): ts {last_ts_value}ms -> {current_ts}ms")
+            current_session_id = f"session_{int(time.time())}"
+            normed["session_id"] = current_session_id
+            with _lock:
+                reset_info.update({
+                    "detected": True, "at": time.time(),
+                    "from_ts": last_ts_value, "to_ts": current_ts,
+                    "session_id": current_session_id,
+                })
+        last_ts_value = current_ts
+
+    # ---- Common post-processing (both formats) --------------------------
+    # GPS-derived speed
+    lat, lon = normed.get("lat"), normed.get("lon")
+    ts_ms = normed.get("ts", 0)
+    with _lock:
+        last_fix_state = _last_gps_fix.copy()
+    if normed.get("speed") is None:
+        if lat is not None and lon is not None and last_fix_state.get("lat") is not None:
+            dt = (ts_ms - last_fix_state["ts"]) / 1000.0
+            normed["speed"] = (
+                _haversine_m(last_fix_state["lat"], last_fix_state["lon"], lat, lon) / dt
+                if dt > 0 else last_fix_state.get("speed", 0.0)
+            )
+        else:
+            normed["speed"] = 0.0
+    if lat is not None and lon is not None:
+        with _lock:
+            _last_gps_fix.update({"lat": lat, "lon": lon, "ts": ts_ms, "speed": normed["speed"]})
+
+    # Track fields
+    with _lock:
+        _attach_track_fields(normed, _track_state)
+
+    # Update shared state
+    with _lock:
+        latest_data.clear()
+        latest_data.update(normed)
+        flight_data.append(normed)
+        data_version += 1
+        pid = normed.get("packet_id")
+        if pid is not None:
+            packet_id_history.append(int(pid))
+
+    save_to_db(normed)
+
+    # Phase transitions and anomalies
+    with _lock:
+        recent = list(flight_data)[-20:]
+    if len(recent) >= 2:
+        current_phase = _detect_flight_phase(recent)
+        with _lock:
+            if latest_data:
+                latest_data["phase"] = current_phase
+            if flight_data:
+                flight_data[-1]["phase"] = current_phase
+        _detect_anomalies(recent, session_id=current_session_id)
+
+    return normed
+
+
+# Shared GPS fix state and track state used by ingest_packet across both paths
+_last_gps_fix: dict = {}
+_track_state:  dict = _new_track_state()
 
 
 def save_to_db(data: dict):
@@ -425,19 +821,23 @@ def save_to_db(data: dict):
                 INSERT INTO telemetry
                     (session_id, packet_id, timestamp, mission_time, altitude, temperature, pressure, humidity,
                      ax, ay, az, gx, gy, gz, lat, lon, battery_voltage, rssi, snr,
-                     launched, ejected, sim, raw_json)
+                     launched, ejected, sim, raw_json,
+                     temp_dht, mq135, current_ma, gps_alt, sats, relay, servo)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?)
+                        ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 data.get("session_id", "default"), data.get("packet_id", 0),
-                data["ts"], data.get("mission_time", 0),
-                data["alt"], data.get("temp", 25), data.get("pressure", 101325), data.get("humidity", 50),
-                data["ax"], data["ay"], data["az"],
-                data["gx"], data["gy"], data["gz"],
+                data.get("ts", 0), data.get("mission_time", 0),
+                data.get("alt"), data.get("temp"), data.get("pressure"), data.get("humidity"),
+                data.get("ax"), data.get("ay"), data.get("az"),
+                data.get("gx"), data.get("gy"), data.get("gz"),
                 data.get("lat"), data.get("lon"),
-                data.get("batt_v", 3.7), data.get("rssi", -100), data.get("snr", 0),
-                data["launched"], data["ejected"], data["sim"],
-                json.dumps(data)
+                data.get("batt_v"), data.get("rssi"), data.get("snr"),
+                data.get("launched", False), data.get("ejected", False), data.get("sim", False),
+                json.dumps(data),
+                data.get("temp_dht"), data.get("mq135"), data.get("current_ma"),
+                data.get("gps_alt"), data.get("sats"), data.get("relay"), data.get("servo"),
             ))
             conn.commit()
     except Exception as e:
@@ -556,8 +956,8 @@ def _detect_flight_phase(recent: list) -> str:
     latest  = recent[-1]
     ejected  = latest.get("ejected",  False)
     launched = latest.get("launched", False)
-    alt      = latest.get("alt", 0)
-    pressure = latest.get("pressure", 101325)
+    alt      = _num(latest.get("alt"), 0)
+    pressure = _num(latest.get("pressure"), 101325)
 
     if ejected:
         return "RECOVERY"
@@ -565,22 +965,22 @@ def _detect_flight_phase(recent: list) -> str:
     if not launched:
         # Check for ignition spike (any packet in last 5 with high az)
         for p in recent[-5:]:
-            if abs(p.get("az", 0)) > 3.0 or alt > 2:
+            if abs(_num(p.get("az"), 0)) > 3.0 or alt > 2:
                 return "IGNITION"
         return "PRE-LAUNCH"
 
-    max_alt = max(p.get("alt", 0) for p in recent)
-    max_pressure = min(p.get("pressure", 101325) for p in recent)  # Lower pressure at altitude
+    max_alt = max(_num(p.get("alt"), 0) for p in recent)
+    max_pressure = min(_num(p.get("pressure"), 101325) for p in recent)  # Lower pressure at altitude
 
     # Estimate vertical velocity from last two packets
     if len(recent) >= 2:
-        dt  = (recent[-1].get("ts", 1) - recent[-2].get("ts", 0)) / 1000.0  # ms → s
-        dh  = recent[-1].get("alt", 0) - recent[-2].get("alt", 0)
+        dt  = (_num(recent[-1].get("ts"), 1) - _num(recent[-2].get("ts"), 0)) / 1000.0  # ms → s
+        dh  = _num(recent[-1].get("alt"), 0) - _num(recent[-2].get("alt"), 0)
         v_z = dh / dt if dt > 0 else 0
     else:
         v_z = 0
 
-    az_net = latest.get("az", 1.0)
+    az_net = _num(latest.get("az"), 1.0)
 
     if az_net > 1.5:           # still under thrust
         return "POWERED_ASCENT"
@@ -611,32 +1011,32 @@ def _detect_anomalies(recent: list, session_id: str = "default") -> list:
     latest = recent[-1]
 
     # High lateral G
-    ax, ay = latest.get("ax", 0), latest.get("ay", 0)
+    ax, ay = _num(latest.get("ax")), _num(latest.get("ay"))
     lateral_g = (ax**2 + ay**2) ** 0.5
     if lateral_g > 2.0:
         anomalies.append({"type": "HIGH_LATERAL_G", "severity": "HIGH", "text": f"HIGH LATERAL G: {lateral_g:.2f}g"})
 
     # Altitude drop after launch
     if latest.get("launched") and len(recent) > 10:
-        alts = [p.get("alt", 0) for p in recent[-10:]]
+        alts = [_num(p.get("alt"), 0) for p in recent[-10:]]
         if alts[-1] < alts[0] - 5:
             anomalies.append({"type": "ALTITUDE_DROP", "severity": "HIGH", "text": f"ALTITUDE DROP: {alts[0]:.1f}m → {alts[-1]:.1f}m"})
 
     # Gyro spike
     for axis in ["gx", "gy", "gz"]:
-        val = abs(latest.get(axis, 0))
+        val = abs(_num(latest.get(axis), 0))
         if val > 500:
             anomalies.append({"type": f"GYRO_SPIKE", "severity": "WARN", "text": f"GYRO SPIKE {axis}: {val:.1f}°/s"})
 
     # Az near zero during ascent
     if latest.get("launched") and not latest.get("ejected"):
-        if abs(latest.get("az", 1)) < 0.05:
+        if abs(_num(latest.get("az"), 1)) < 0.05:
             anomalies.append({"type": "AZ_NEAR_ZERO", "severity": "WARN", "text": "AZ ≈ 0: possible free-fall"})
 
     # Descent rate validation for ejection confirmation
     if latest.get("ejected") and len(recent) >= 2:
-        dt = (recent[-1].get("ts", 1) - recent[-2].get("ts", 0)) / 1000.0
-        dh = recent[-1].get("alt", 0) - recent[-2].get("alt", 0)
+        dt = (_num(recent[-1].get("ts"), 1) - _num(recent[-2].get("ts"), 0)) / 1000.0
+        dh = _num(recent[-1].get("alt"), 0) - _num(recent[-2].get("alt"), 0)
         descent_rate = abs(dh / dt) if dt > 0 else 0
         # Expected descent rate with parachute: 5-10 m/s
         if descent_rate < 2.0:
@@ -644,36 +1044,27 @@ def _detect_anomalies(recent: list, session_id: str = "default") -> list:
         if descent_rate > 50.0:
             anomalies.append({"type": "HIGH_DESCENT_RATE", "severity": "HIGH", "text": f"High descent rate: {descent_rate:.2f} m/s"})
 
-    # Low battery
-    if latest.get("batt_v", 3.7) < 3.2:
-        anomalies.append({"type": "LOW_BATTERY", "severity": "WARN", "text": f"Low battery: {latest.get('batt_v', 0):.2f}V"})
+    # Low battery — skip when the packet has no voltage field
+    batt = latest.get("batt_v")
+    if batt is not None and _num(batt) < 3.2:
+        anomalies.append({"type": "LOW_BATTERY", "severity": "WARN", "text": f"Low battery: {_num(batt):.2f}V"})
 
-    # Signal loss
-    if latest.get("rssi", -100) < -110:
-        anomalies.append({"type": "WEAK_SIGNAL", "severity": "WARN", "text": f"Weak signal: {latest.get('rssi', 0)} dBm"})
+    # Signal loss — skip when RSSI is unavailable (E220 transparent mode)
+    rssi = latest.get("rssi")
+    if rssi is not None and _num(rssi) < -110:
+        anomalies.append({"type": "WEAK_SIGNAL", "severity": "WARN", "text": f"Weak signal: {rssi} dBm"})
 
-    # Log anomalies on rising edge only (plus a 5s throttle backstop).
+    # Log anomalies with a 30-second cooldown per (session, type, severity)
+    # to eliminate oscillating duplicate entries from alternating sensor packets.
     now = time.time()
-    present = {(a["type"], a["severity"]) for a in anomalies}
     to_insert = []
     with _anomaly_lock:
-        stale = [
-            k for k in _open_anomalies
-            if k[0] == session_id and (k[1], k[2]) not in present
-        ]
-        for k in stale:
-            del _open_anomalies[k]
         for anom in anomalies:
             key = (session_id, anom["type"], anom["severity"])
             last = _open_anomalies.get(key)
-            if last is None:
+            if last is None or (now - last) >= 30.0:
                 to_insert.append(anom)
                 _open_anomalies[key] = now
-            elif now - last < ANOMALY_THROTTLE_S:
-                _open_anomalies[key] = last  # still open; no extra insert
-            else:
-                # Condition still present: keep open, do not insert again.
-                pass
 
     if to_insert:
         try:
@@ -702,10 +1093,10 @@ def _detect_anomalies(recent: list, session_id: str = "default") -> list:
 # SERIAL THREAD
 # =====================================================================
 def read_serial():
-    global serial_connected, current_session_id, last_ts_value, data_version, port_reload_flag
+    global serial_connected, port_reload_flag
     backoff = 2
     prev_phase = "PRE-LAUNCH"
-    
+
     print(f"🔄 Serial thread started — target port: {SERIAL_PORT}")
 
     while True:
@@ -722,8 +1113,12 @@ def read_serial():
                 serial_connected = True
                 port_reload_flag = False
             print(f"✅ Serial connected on {SERIAL_PORT}")
-            last_gps_fix = None
-            track_state = _new_track_state()
+
+            # Reset shared GPS / track state for this serial session
+            with _lock:
+                _last_gps_fix.clear()
+                _track_state.clear()
+                _track_state.update(_new_track_state())
 
             while True:
                 try:
@@ -745,53 +1140,13 @@ def read_serial():
                         raw_data, _ = json.JSONDecoder().raw_decode(line[idx:])
                     except json.JSONDecodeError:
                         continue
-                    data     = _sanitise_packet(raw_data)
 
-                    # Reset detection: check if ts counter has reset to 0 or near-0
-                    current_ts = data.get("ts", 0)
-                    if last_ts_value > 10000 and current_ts < 1000:
-                        print(f"🔄 RESET DETECTED: ts went from {last_ts_value}ms → {current_ts}ms (CanSat restarted)")
-                        current_session_id = f"session_{int(time.time())}"  # New session
-                        with _lock:
-                            reset_info.update({
-                                "detected": True,
-                                "at": time.time(),
-                                "from_ts": last_ts_value,
-                                "to_ts": current_ts,
-                                "session_id": current_session_id,
-                            })
-                    last_ts_value = current_ts
-                    data["session_id"] = current_session_id
+                    # Route through ingest_packet (handles both old and new formats)
+                    ingest_packet(raw_data, source="serial")
 
-                    lat, lon = data.get("lat"), data.get("lon")
-                    if data.get("speed") is None and lat is not None and lon is not None and last_gps_fix:
-                        dt = (current_ts - last_gps_fix["ts"]) / 1000.0
-                        if dt > 0:
-                            data["speed"] = _haversine_m(last_gps_fix["lat"], last_gps_fix["lon"], lat, lon) / dt
-                        else:
-                            data["speed"] = last_gps_fix.get("speed", 0.0)
-                    elif data.get("speed") is None:
-                        data["speed"] = 0.0
-                    if lat is not None and lon is not None:
-                        last_gps_fix = {"lat": lat, "lon": lon, "ts": current_ts, "speed": data.get("speed") or 0.0}
-
-                    _attach_track_fields(data, track_state)
-
+                    # Phase transition logging (uses data already in flight_data)
                     with _lock:
-                        latest_data.clear()
-                        latest_data.update(data)
-                        flight_data.append(data)
-                        data_version += 1
-                        pid = data.get("packet_id")
-                        if pid is not None:
-                            packet_id_history.append(int(pid))
-
-                    save_to_db(data)
-                    
-                    # Phase transition logging
-                    with _lock:
-                        recent = list(flight_data)[-20:]  # Last 20 packets
-                    
+                        recent = list(flight_data)[-20:]
                     if len(recent) >= 2:
                         current_phase = _detect_flight_phase(recent)
                         if current_phase != prev_phase:
@@ -802,17 +1157,9 @@ def read_serial():
                                 phase=current_phase,
                                 recent=recent,
                                 session_id=current_session_id,
-                                v_z=v_z
+                                v_z=v_z,
                             )
                             prev_phase = current_phase
-                        with _lock:
-                            if latest_data:
-                                latest_data["phase"] = current_phase
-                            if flight_data:
-                                flight_data[-1]["phase"] = current_phase
-                        
-                        # Detect and log anomalies
-                        _detect_anomalies(recent, session_id=current_session_id)
 
                 except serial.SerialException as e:
                     print(f"❌ Serial lost: {e}")
@@ -836,46 +1183,187 @@ def read_serial():
 
 
 # =====================================================================
-# CONTINUOUS AI ANALYSIS THREAD
+# CONTINUOUS AI ANALYSIS THREAD (NVIDIA Nemotron-3 Ultra 550B)
 # =====================================================================
 def _build_ai_prompt(recent: list, stats: dict, phase: str, anomalies: list) -> str:
-    """Build a detailed, rocket-specific prompt for Gemini."""
+    """Build a detailed CanSat/rocket telemetry prompt for Nemotron-3 Ultra."""
     anomaly_block = (
-        "ANOMALIES DETECTED:\n" + "\n".join(f"  • {a}" for a in anomalies)
+        "ANOMALIES DETECTED:\n" + "\n".join(f"  • {a.get('text', a.get('type', str(a))) if isinstance(a, dict) else str(a)}" for a in anomalies)
         if anomalies else "No anomalies detected."
     )
 
-    # Downsample to last 20 packets for prompt brevity
     sample = recent[-20:]
     table_rows = []
     for p in sample:
         table_rows.append(
-            f"  t={p.get('ts','?')}ms  alt={p.get('alt',0):.2f}m  "
-            f"ax={p.get('ax',0):.3f}g ay={p.get('ay',0):.3f}g az={p.get('az',0):.3f}g  "
-            f"gx={p.get('gx',0):.1f} gy={p.get('gy',0):.1f} gz={p.get('gz',0):.1f}"
+            f"  t={p.get('ts','?')}ms alt={p.get('alt',0):.2f}m "
+            f"ax={p.get('ax',0):.3f}g ay={p.get('ay',0):.3f}g az={p.get('az',0):.3f}g "
+            f"gx={p.get('gx',0):.1f} gy={p.get('gy',0):.1f} gz={p.get('gz',0):.1f} "
+            f"press={p.get('pressure',0):.1f}Pa temp={p.get('temp',0):.1f}C"
         )
     table = "\n".join(table_rows)
 
-    return f"""You are an expert aerospace engineer analysing live rocket telemetry.
+    return f"""You are an expert aerospace engineer analysing live CanSat telemetry from Team Vikram Mission Control.
 
 === FLIGHT SUMMARY ===
-Detected phase : {phase}
-Peak altitude  : {stats['max_alt']:.2f} m
-Total packets  : {stats['points']}
+Detected Phase : {phase}
+Peak Altitude  : {stats.get('max_alt', 0):.2f} m
+Total Packets  : {stats.get('points', 0)}
 {anomaly_block}
 
 === LAST 20 TELEMETRY PACKETS ===
-(columns: timestamp, altitude, accel X/Y/Z in g, gyro X/Y/Z in °/s)
+(columns: timestamp, altitude, accel X/Y/Z in g, gyro X/Y/Z in °/s, pressure, temperature)
 {table}
 
 === TASK ===
 Write a concise (≤150 words) professional aeronautical status report:
-1. Confirm the current flight phase and justify it with the data.
-2. Comment on airframe stability (lateral G, gyro rates).
+1. Confirm the current flight phase and justify it using the telemetry.
+2. Comment on airframe stability (lateral G, gyro angular rates).
 3. Flag any anomalies and their engineering significance.
-4. Recommend any action if needed (e.g. "monitor descent rate", "verify ejection charge continuity").
-Use precise units. Avoid filler phrases like "it seems" or "it appears".
+4. Recommend actionable next steps (e.g. "monitor descent rate", "verify parachute deployment").
+Use precise SI units. Avoid filler phrases like "it seems" or "it appears".
 """
+
+
+def query_nemotron(prompt: str) -> tuple[str, str]:
+    """Execute streaming inference on nvidia/nemotron-3-ultra-550b-a55b with thinking enabled."""
+    if ai_client:
+        completion = ai_client.chat.completions.create(
+            model=NVIDIA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=1,
+            top_p=0.95,
+            max_tokens=16384,
+            extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+            stream=True,
+        )
+
+        reasoning_parts = []
+        content_parts = []
+
+        for chunk in completion:
+            if not chunk.choices:
+                continue
+            reasoning = getattr(chunk.choices[0].delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_parts.append(reasoning)
+            if chunk.choices[0].delta.content is not None:
+                content_parts.append(chunk.choices[0].delta.content)
+
+        return "".join(content_parts).strip(), "".join(reasoning_parts).strip()
+
+    if not NVIDIA_API_KEY:
+        raise RuntimeError("NVIDIA API key not configured")
+
+    # Direct HTTPS streaming fallback if openai package is not available
+    import urllib.request
+    url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    payload = {
+        "model": NVIDIA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 1,
+        "top_p": 0.95,
+        "max_tokens": 16384,
+        "chat_template_kwargs": {"enable_thinking": True},
+        "stream": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+    reasoning_parts = []
+    content_parts = []
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        for line in resp:
+            line_str = line.decode("utf-8", errors="ignore").strip()
+            if not line_str.startswith("data:"):
+                continue
+            data_str = line_str[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                choice = chunk.get("choices", [{}])[0]
+                delta = choice.get("delta", {})
+                r = delta.get("reasoning_content")
+                if r:
+                    reasoning_parts.append(r)
+                c = delta.get("content")
+                if c:
+                    content_parts.append(c)
+            except Exception:
+                pass
+
+    return "".join(content_parts).strip(), "".join(reasoning_parts).strip()
+
+
+def _analyse_flight(snap: list) -> dict:
+    """Analyse flight snapshot with NVIDIA Nemotron-3 Ultra 550B, falling back to local model."""
+    recent = snap[-100:] if snap else []
+    phase = _detect_flight_phase(recent)
+    anomalies = _detect_anomalies(recent, session_id=current_session_id)
+    stats = {
+        "max_alt": max((p.get("alt", 0) or 0) for p in snap) if snap else 0.0,
+        "points": len(snap),
+    }
+
+    # Summary for PDF generation
+    summary = {}
+    if build_flight_report:
+        try:
+            _, summary = build_flight_report(recent, phase, anomalies)
+        except Exception as e:
+            print(f"⚠️  Local report summary build error: {e}")
+
+    # 1. Try NVIDIA Nemotron-3 Ultra 550b
+    if ai_client or NVIDIA_API_KEY:
+        try:
+            prompt = _build_ai_prompt(recent, stats, phase, anomalies)
+            content, reasoning = query_nemotron(prompt)
+            if content:
+                return {
+                    "analysis": content,
+                    "reasoning": reasoning,
+                    "timestamp": time.time(),
+                    "provider": f"NVIDIA Nemotron-3 Ultra 550B ({NVIDIA_MODEL})",
+                    "phase": phase,
+                    "anomalies": anomalies,
+                    "summary": summary,
+                    "cached": False,
+                }
+        except Exception as err:
+            print(f"⚠️  NVIDIA Nemotron error (falling back to local): {err}")
+
+    # 2. Local fallback model
+    if build_flight_report:
+        try:
+            local_analysis, summary = build_flight_report(recent, phase, anomalies)
+            return {
+                "analysis": local_analysis,
+                "reasoning": None,
+                "timestamp": time.time(),
+                "provider": f"Local Model ({FLIGHT_ML_PROVIDER})",
+                "phase": phase,
+                "anomalies": anomalies,
+                "summary": summary,
+                "cached": False,
+            }
+        except Exception as err:
+            print(f"⚠️  Local flight model error: {err}")
+
+    # 3. Simple fallback
+    return {
+        "analysis": f"Phase: {phase}. Altitude: {stats['max_alt']:.1f}m. Packets: {stats['points']}.",
+        "reasoning": None,
+        "timestamp": time.time(),
+        "provider": "telemetry-fallback",
+        "phase": phase,
+        "anomalies": anomalies,
+        "summary": summary,
+        "cached": False,
+    }
 
 
 def continuous_ai_analysis():
@@ -887,9 +1375,6 @@ def continuous_ai_analysis():
     while True:
         time.sleep(AI_ANALYSIS_INTERVAL)
 
-        if not ai_client:
-            continue
-
         with _lock:
             snap = list(flight_data)
 
@@ -897,87 +1382,19 @@ def continuous_ai_analysis():
             continue
 
         if ai_cache["running"]:
-            continue   # previous call still in flight
+            continue
 
         ai_cache["running"] = True
         try:
-            recent = snap[-100:]
-            phase  = _detect_flight_phase(recent)
-            anomalies = _detect_anomalies(recent, session_id=current_session_id)
-            stats  = {
-                "max_alt": max(p.get("alt", 0) for p in snap),
-                "points":  len(snap),
-            }
-            
-            # Extract text from anomaly dicts for prompt
-            anomaly_texts = [a.get("text", a.get("type", str(a))) for a in anomalies]
-
-            prompt = _build_ai_prompt(recent, stats, phase, anomaly_texts)
-
-            try:
-                resp = ai_client.chat.completions.create(
-                    model="nvidia/nemotron-3-ultra-550b-a55b",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=1,
-                    top_p=0.95,
-                    max_tokens=16384,
-                )
-                analysis_text = resp.choices[0].message.content
-                provider      = "nvidia-nemotron"
-            except Exception as ai_err:
-                print(f"⚠️  NVIDIA AI error (falling back): {ai_err}")
-                analysis_text = generate_fallback_analysis({"max_alt": stats["max_alt"],
-                                                            "points":  stats["points"],
-                                                            "latest":  recent[-1]})
-                provider = "system-fallback"
-
-            ai_cache.update({
-                "analysis":  analysis_text,
-                "timestamp": time.time(),
-                "provider":  provider,
-                "phase":     phase,
-                "anomalies": anomalies,
-                "running":   False,
-            })
-            print(f"🤖 AI analysis updated — phase={phase}, anomalies={len(anomalies)}")
-
+            result = _analyse_flight(snap)
+            ai_cache.update(result | {"running": False})
+            print(
+                f"🤖 AI analysis updated — phase={result['phase']}, "
+                f"anomalies={len(result['anomalies'])}"
+            )
         except Exception as e:
             print(f"⚠️  Continuous AI error: {e}")
             ai_cache["running"] = False
-
-
-# =====================================================================
-# FALLBACK ANALYSIS (offline)
-# =====================================================================
-def generate_fallback_analysis(stats: dict) -> str:
-    latest  = stats.get("latest", {})
-    phase   = _detect_flight_phase([latest]) if latest else "UNKNOWN"
-    alt     = latest.get("alt", 0)
-    ax, ay  = latest.get("ax", 0), latest.get("ay", 0)
-    lateral = (ax**2 + ay**2) ** 0.5
-
-    stability = (
-        f"Lateral G = {lateral:.2f}g — moderate oscillation detected."
-        if lateral > 1.5 else
-        f"Lateral G = {lateral:.2f}g — airframe stable."
-    )
-
-    phase_detail = {
-        "PRE-LAUNCH":      "System armed, awaiting ignition event.",
-        "IGNITION":        "Ignition transient detected. Monitoring for full thrust.",
-        "POWERED_ASCENT":  "Positive net thrust confirmed. Structural loads nominal.",
-        "COAST":           "Motor burnout. Vehicle coasting under aerodynamic forces.",
-        "APOGEE":          "Peak altitude reached. Monitoring for recovery deployment.",
-        "DESCENT":         "Descent phase active. Tracking terminal velocity.",
-        "RECOVERY":        "Ejection confirmed. Recovery system deployed.",
-    }.get(phase, "Phase indeterminate.")
-
-    return (
-        f"**OFFLINE FLIGHT ANALYSIS**\n\n"
-        f"Phase: **{phase}** | Peak altitude: {stats.get('max_alt', alt):.2f} m | "
-        f"Packets: {stats.get('points', 1)}\n\n"
-        f"{stability} {phase_detail}"
-    )
 
 
 # =====================================================================
@@ -987,6 +1404,21 @@ def generate_fallback_analysis(stats: dict) -> str:
 @app.route("/")
 def home():
     return render_template("index.html")
+
+
+@app.route("/compact")
+@app.route("/ground-station")
+def compact_view():
+    return redirect("/")
+
+
+@app.route("/static/<path:filename>")
+def serve_static_alias(filename):
+    for d in ["template/vendor", "template"]:
+        p = os.path.join(os.path.dirname(__file__), d, filename)
+        if os.path.exists(p) and os.path.isfile(p):
+            return send_file(p)
+    return "", 404
 
 
 @app.route("/style.css")
@@ -1012,12 +1444,16 @@ def telemetry():
 
 
 @app.route("/telemetry/all", methods=["GET"])
+@app.route("/api/history", methods=["GET"])
 def telemetry_all():
+    n = request.args.get("n", type=int)
     since_ts = request.args.get("since_ts", type=int)
     with _lock:
         snap = list(flight_data)
     if since_ts is not None:
         snap = [p for p in snap if (p.get("ts") or 0) > since_ts]
+    if n is not None:
+        snap = snap[-min(n, 5000):]
     return jsonify(snap)
 
 
@@ -1059,14 +1495,38 @@ def status():
     if ld:
         last_good = time.time()  # approximate; client tracks more precisely via SSE
 
+    # WiFi receiver state
+    with _uplink_lock:
+        rx_state = dict(_wifi_rx_state)
+        pending_cmds = len(_uplink_queue)
+
+    now = time.time()
+    last_pkt_t = rx_state.get("last_packet_t") or (ld.get("ts", 0) / 1000.0 if ld.get("ts") else None)
+    last_rx_t  = rx_state.get("last_rx_poll_t")
+    rx_online  = (last_rx_t  is not None) and (now - last_rx_t  < RX_ONLINE_TIMEOUT_S)
+    link_ok    = (last_pkt_t is not None) and (now - last_pkt_t < LINK_TIMEOUT_S)
+    # connected = serial OR wifi link
+    connected  = conn or link_ok
+    lost_count = rx_state.get("lost", 0)
+    bad_count  = rx_state.get("bad", 0)
+    last_pkt_age = round(now - last_pkt_t, 1) if last_pkt_t else None
+
+    # Merge packet-id-history losses with wifi_rx_state lost counter
+    if len(pids) >= 2:
+        expected = max(pids) - min(pids) + 1
+        if expected > 0:
+            packet_loss_pct = max(0.0, (1 - len(set(pids)) / expected) * 100)
+
     return jsonify({
-        "connected":        conn,
+        # ── existing keys (unchanged) ──
+        "connected":        connected,
         "serial_connected": conn,
         "has_telemetry":    bool(ld),
         "packets_received": pkts,
         "latest_ts":        ld.get("ts"),
         "port":             SERIAL_PORT,
         "ai_enabled":       ai_client is not None,
+        "ai_model":         NVIDIA_MODEL if ai_client else FLIGHT_ML_PROVIDER,
         "ai_last_run":      ai_cache.get("timestamp"),
         "flight_phase":     ai_cache.get("phase") or _detect_flight_phase(snap[-20:] if snap else []),
         "data_version":     ver,
@@ -1076,7 +1536,17 @@ def status():
         "packet_loss_pct":  round(packet_loss_pct, 1),
         "reset":            reset,
         "last_good_at":     last_good,
-        "server_time":      time.time(),
+        "server_time":      now,
+        # ── new keys for WiFi receiver ──
+        "rx_online":        rx_online,
+        "link_ok":          link_ok,
+        "lost":             lost_count,
+        "bad":              bad_count,
+        "last_packet_age":  last_pkt_age,
+        "pending_commands": pending_cmds,
+        "session_start_t":  rx_state.get("session_start_t") or ((snap[0].get("ts") / 1000.0) if (snap and snap[0].get("ts") and snap[0].get("ts") > 1e11) else None),
+        "duration_s":       round(now - rx_state.get("session_start_t"), 1) if rx_state.get("session_start_t") else (ld.get("mission_time", 0.0) if ld else 0.0),
+        "mission_time":     ld.get("mission_time", 0.0) if ld else 0.0,
     })
 
 
@@ -1192,6 +1662,7 @@ def get_phases():
 
 
 @app.route("/stream")
+@app.route("/api/stream")
 def stream_sse():
     """Server-Sent Events stream for live telemetry (fallback: client polls)."""
     def event_stream():
@@ -1204,25 +1675,32 @@ def stream_sse():
                 pkts = len(flight_data)
                 reset = dict(reset_info)
                 session = current_session_id
+            now = time.time()
+            with _uplink_lock:
+                rx_state = dict(_wifi_rx_state)
+            last_pkt_t = rx_state.get("last_packet_t") or (ld.get("ts", 0) / 1000.0 if ld.get("ts") else None)
+            link_ok = (last_pkt_t is not None) and (now - last_pkt_t < LINK_TIMEOUT_S)
+            is_live = bool(conn or link_ok)
             if ver != last_ver:
                 last_ver = ver
                 payload = {
                     "type": "telemetry",
                     "version": ver,
                     "latest": ld,
-                    "connected": conn,
-                    "serial_connected": conn,
+                    "connected": is_live,
+                    "serial_connected": is_live,
+                    "link_ok": link_ok,
                     "has_telemetry": bool(ld),
                     "session_id": session,
                     "reset": reset,
                     "phase": ai_cache.get("phase"),
-                    "server_time": time.time(),
+                    "server_time": now,
                     "summary": _mission_summary_payload(),
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
             else:
                 # heartbeat keeps proxies from closing the stream
-                yield f": ping {time.time()}\n\n"
+                yield f": ping {now}\n\n"
             time.sleep(0.35)
 
     return Response(
@@ -1340,12 +1818,43 @@ def flight_report():
     return Response(doc, mimetype="text/html")
 
 
+@app.route("/report.pdf")
+def flight_report_pdf():
+    """Downloadable PDF from the local flight model (fpdf2)."""
+    if _FPDF is None:
+        return jsonify({
+            "error": "fpdf2 is not installed",
+            "hint": "pip install fpdf2 pandas",
+        }), 500
+    with _lock:
+        snap = list(flight_data)
+    if not snap:
+        return jsonify({"error": "No telemetry yet"}), 404
+    result = _analyse_flight(snap)
+    pdf_bytes = build_flight_pdf(
+        result["analysis"], result.get("summary") or {}, snap[-200:], result["phase"]
+    )
+    try:
+        save_flight_pdf(
+            result["analysis"], result.get("summary") or {}, snap[-200:], result["phase"]
+        )
+    except OSError as exc:
+        print(f"⚠️  Could not save PDF copy: {exc}")
+    return send_file(
+        io.BytesIO(pdf_bytes),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=f"vikram_flight_{current_session_id}.pdf",
+    )
+
+
 @app.route("/api/ai-analysis/latest", methods=["GET"])
 def ai_analysis_latest():
     """Return the most recently cached AI analysis instantly."""
     if ai_cache["analysis"] is None:
         return jsonify({
             "analysis": None,
+            "reasoning": None,
             "phase": ai_cache.get("phase"),
             "anomalies": ai_cache.get("anomalies") or [],
             "cached": True,
@@ -1354,6 +1863,7 @@ def ai_analysis_latest():
         }), 200
     return jsonify({
         "analysis":  ai_cache["analysis"],
+        "reasoning": ai_cache.get("reasoning"),
         "timestamp": ai_cache["timestamp"],
         "provider":  ai_cache["provider"],
         "phase":     ai_cache["phase"],
@@ -1365,20 +1875,13 @@ def ai_analysis_latest():
 @app.route("/api/ai-analysis", methods=["GET"])
 @rate_limit
 def ai_analysis():
-    """
-    Trigger an on-demand AI analysis (rate limited).
-    Returns a fresh result, falling back to cache if AI is busy.
-    """
-    if not ai_client:
-        return jsonify({"error": "NVIDIA AI client not initialised"}), 500
-
+    """Trigger an on-demand local flight analysis (rate limited)."""
     with _lock:
         snap = list(flight_data)
 
     if len(snap) < AI_MIN_PACKETS:
         return jsonify({"error": f"Not enough data yet ({len(snap)}/{AI_MIN_PACKETS} packets)"}), 404
 
-    # If background thread already has a fresh result (< 30 s old), use it
     if ai_cache["analysis"] and ai_cache["timestamp"]:
         age = time.time() - ai_cache["timestamp"]
         if age < 30:
@@ -1386,40 +1889,9 @@ def ai_analysis():
             result["cached"] = True
             return jsonify(result)
 
-    # Otherwise compute synchronously
-    recent    = snap[-100:]
-    phase     = _detect_flight_phase(recent)
-    anomalies = _detect_anomalies(recent)
-    stats     = {"max_alt": max(p.get("alt", 0) for p in snap), "points": len(snap)}
-    prompt    = _build_ai_prompt(recent, stats, phase, anomalies)
-
-    try:
-        resp     = ai_client.chat.completions.create(
-            model="nvidia/nemotron-3-ultra-550b-a55b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=1,
-            top_p=0.95,
-            max_tokens=16384,
-        )
-        analysis = resp.choices[0].message.content
-        provider = "nvidia-nemotron"
-    except Exception as ai_err:
-        print(f"⚠️  NVIDIA AI on-demand error: {ai_err}")
-        analysis = generate_fallback_analysis({"max_alt": stats["max_alt"],
-                                               "points":  stats["points"],
-                                               "latest":  recent[-1]})
-        provider = "system-fallback"
-
-    result = {
-        "analysis":  analysis,
-        "timestamp": time.time(),
-        "provider":  provider,
-        "phase":     phase,
-        "anomalies": anomalies,
-        "cached":    False,
-    }
+    result = _analyse_flight(snap)
     ai_cache.update(result | {"running": False})
-    return jsonify(result)
+    return jsonify({k: v for k, v in result.items() if k != "summary"})
 
 
 @app.route("/test-data", methods=["GET", "POST"])
@@ -1430,14 +1902,15 @@ def test_data():
     global data_version
     import uuid
     session_id = str(uuid.uuid4())[:8]
+    now_ms = int(time.time() * 1000)
     packets = [
-        {"session_id": session_id, "packet_id": 1, "alt": 0,   "temp": 28.5, "pressure": 101325, "humidity": 55, "lat": 12.9626, "lon": 79.9541, "batt_v": 3.95, "rssi": -75, "snr": 8.5, "ax": 0.008, "ay": 0.001, "az": 0.986, "gx": 0.07, "gy": 0.17, "gz": 0.02, "launched": False, "ejected": False, "sim": True, "ts": 858000, "mission_time": 0},
-        {"session_id": session_id, "packet_id": 2, "alt": 5,   "temp": 28.3, "pressure": 101290, "humidity": 55, "lat": 12.9627, "lon": 79.9542, "batt_v": 3.94, "rssi": -74, "snr": 8.7, "ax": 0.01,  "ay": 0.002, "az": 0.99,  "gx": 0.08, "gy": 0.18, "gz": 0.02, "launched": False, "ejected": False, "sim": True, "ts": 858300, "mission_time": 0.3},
-        {"session_id": session_id, "packet_id": 3, "alt": 15,  "temp": 28.0, "pressure": 101200, "humidity": 54, "lat": 12.9628, "lon": 79.9543, "batt_v": 3.92, "rssi": -72, "snr": 9.2, "ax": 0.02,  "ay": 0.005, "az": 2.50,  "gx": 0.10, "gy": 0.20, "gz": 0.03, "launched": True,  "ejected": False, "sim": True, "ts": 858600, "mission_time": 0.6},
-        {"session_id": session_id, "packet_id": 4, "alt": 50,  "temp": 27.5, "pressure": 100950, "humidity": 52, "lat": 12.9630, "lon": 79.9545, "batt_v": 3.88, "rssi": -68, "snr": 10.1, "ax": 0.05,  "ay": 0.01,  "az": 3.20,  "gx": 0.15, "gy": 0.25, "gz": 0.05, "launched": True,  "ejected": False, "sim": True, "ts": 858900, "mission_time": 0.9},
-        {"session_id": session_id, "packet_id": 5, "alt": 120, "temp": 26.8, "pressure": 100450, "humidity": 50, "lat": 12.9633, "lon": 79.9548, "batt_v": 3.82, "rssi": -65, "snr": 11.0, "ax": 0.03,  "ay": 0.008, "az": 1.10,  "gx": 0.12, "gy": 0.22, "gz": 0.04, "launched": True,  "ejected": False, "sim": True, "ts": 859200, "mission_time": 1.2},
-        {"session_id": session_id, "packet_id": 6, "alt": 200, "temp": 25.5, "pressure": 99725, "humidity": 48, "lat": 12.9636, "lon": 79.9551, "batt_v": 3.75, "rssi": -62, "snr": 12.3, "ax": 0.02,  "ay": 0.005, "az": 0.98,  "gx": 0.10, "gy": 0.19, "gz": 0.03, "launched": True,  "ejected": False, "sim": True, "ts": 859500, "mission_time": 1.5},
-        {"session_id": session_id, "packet_id": 7, "alt": 198, "temp": 25.2, "pressure": 99850, "humidity": 48, "lat": 12.9637, "lon": 79.9552, "batt_v": 3.73, "rssi": -61, "snr": 12.5, "ax": 0.01,  "ay": 0.003, "az": 0.05,  "gx": 0.05, "gy": 0.10, "gz": 0.01, "launched": True,  "ejected": True,  "sim": True, "ts": 859800, "mission_time": 1.8},
+        {"session_id": session_id, "packet_id": 1, "alt": 0,   "temp": 28.5, "pressure": 101325, "humidity": 55, "lat": 12.9626, "lon": 79.9541, "batt_v": 3.95, "rssi": -75, "snr": 8.5, "ax": 0.008, "ay": 0.001, "az": 0.986, "gx": 0.07, "gy": 0.17, "gz": 0.02, "launched": False, "ejected": False, "sim": True, "ts": now_ms - 6000, "mission_time": 0},
+        {"session_id": session_id, "packet_id": 2, "alt": 5,   "temp": 28.3, "pressure": 101290, "humidity": 55, "lat": 12.9627, "lon": 79.9542, "batt_v": 3.94, "rssi": -74, "snr": 8.7, "ax": 0.01,  "ay": 0.002, "az": 0.99,  "gx": 0.08, "gy": 0.18, "gz": 0.02, "launched": False, "ejected": False, "sim": True, "ts": now_ms - 5000, "mission_time": 0.3},
+        {"session_id": session_id, "packet_id": 3, "alt": 15,  "temp": 28.0, "pressure": 101200, "humidity": 54, "lat": 12.9628, "lon": 79.9543, "batt_v": 3.92, "rssi": -72, "snr": 9.2, "ax": 0.02,  "ay": 0.005, "az": 2.50,  "gx": 0.10, "gy": 0.20, "gz": 0.03, "launched": True,  "ejected": False, "sim": True, "ts": now_ms - 4000, "mission_time": 0.6},
+        {"session_id": session_id, "packet_id": 4, "alt": 50,  "temp": 27.5, "pressure": 100950, "humidity": 52, "lat": 12.9630, "lon": 79.9545, "batt_v": 3.88, "rssi": -68, "snr": 10.1, "ax": 0.05,  "ay": 0.01,  "az": 3.20,  "gx": 0.15, "gy": 0.25, "gz": 0.05, "launched": True,  "ejected": False, "sim": True, "ts": now_ms - 3000, "mission_time": 0.9},
+        {"session_id": session_id, "packet_id": 5, "alt": 120, "temp": 26.8, "pressure": 100450, "humidity": 50, "lat": 12.9633, "lon": 79.9548, "batt_v": 3.82, "rssi": -65, "snr": 11.0, "ax": 0.03,  "ay": 0.008, "az": 1.10,  "gx": 0.12, "gy": 0.22, "gz": 0.04, "launched": True,  "ejected": False, "sim": True, "ts": now_ms - 2000, "mission_time": 1.2},
+        {"session_id": session_id, "packet_id": 6, "alt": 200, "temp": 25.5, "pressure": 99725, "humidity": 48, "lat": 12.9636, "lon": 79.9551, "batt_v": 3.75, "rssi": -62, "snr": 12.3, "ax": 0.02,  "ay": 0.005, "az": 0.98,  "gx": 0.10, "gy": 0.19, "gz": 0.03, "launched": True,  "ejected": False, "sim": True, "ts": now_ms - 1000, "mission_time": 1.5},
+        {"session_id": session_id, "packet_id": 7, "alt": 198, "temp": 25.2, "pressure": 99850, "humidity": 48, "lat": 12.9637, "lon": 79.9552, "batt_v": 3.73, "rssi": -61, "snr": 12.5, "ax": 0.01,  "ay": 0.003, "az": 0.05,  "gx": 0.05, "gy": 0.10, "gz": 0.01, "launched": True,  "ejected": True,  "sim": True, "ts": now_ms,        "mission_time": 1.8},
     ]
     clean = [_sanitise_packet(p) for p in packets]
     last_fix = None
@@ -1467,33 +1940,101 @@ def test_data():
 
 @app.route("/ports", methods=["GET"])
 def ports():
-    return jsonify({"available_ports": list_available_ports(), "current_port": SERIAL_PORT})
+    ports_info = []
+    try:
+        for p in serial.tools.list_ports.comports():
+            desc = f" ({p.description})" if p.description and p.description != p.device and "n/a" not in p.description.lower() else ""
+            ports_info.append({"port": p.device, "label": f"{p.device}{desc}"})
+    except Exception as e:
+        print(f"⚠️  Error enumerating COM ports: {e}")
+    available = [p["port"] for p in ports_info]
+    return jsonify({
+        "available_ports": available,
+        "ports_info": ports_info,
+        "current_port": SERIAL_PORT,
+        "serial_connected": serial_connected
+    })
 
 
 def send_command():
-    """M4: Receive and queue uplink commands (ARM, DEPLOY, ABORT)."""
+    """Receive and queue uplink commands.
+
+    Accepts both:
+    - Old format: {"command": "ARM"|"DEPLOY"|"ABORT"} — acknowledged, logged, behaviour unchanged.
+    - New hardware: {"relay": 0|1}, {"servo": 0-180}, {"cal": 1} — queued for WiFi receiver.
+    """
     try:
         data = request.get_json(silent=True) or {}
         if not data:
             return jsonify({"status": "error", "message": "JSON body required"}), 400
-        cmd = data.get("command", "").upper()
+
+        cmd_str: str | None = None    # compact JSON to queue for WiFi receiver
+        log_cmd: str = ""
         packet_id = data.get("packet_id", 0)
-        
-        if cmd not in ["ARM", "DEPLOY", "ABORT"]:
-            return jsonify({"status": "error", "message": "Invalid command"}), 400
-        
-        # Log command
-        command_time = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-        print(f"[COMMAND] {cmd} received (packet_id={packet_id}) at {command_time}")
-        
-        # Queue command for serial transmission (would be sent to rocket_tx)
-        # For now, just acknowledge
+
+        if "relay" in data and data["relay"] in (0, 1, True, False):
+            r_val = int(data["relay"])
+            cmd_str = json.dumps({"r": r_val}, separators=(",", ":"))
+            log_cmd = f"RELAY={r_val}"
+
+        elif data.get("cal"):
+            cmd_str = json.dumps({"cal": 1}, separators=(",", ":"))
+            log_cmd = "CAL_ZERO"
+
+        elif "servo" in data:
+            try:
+                angle = max(0, min(180, int(data["servo"])))
+                cmd_str = json.dumps({"sv": angle}, separators=(",", ":"))
+                log_cmd = f"SERVO={angle}"
+            except (TypeError, ValueError):
+                return jsonify({"status": "error", "message": "Invalid servo value"}), 400
+
+        else:
+            # Old format: ARM / DEPLOY / ABORT
+            cmd = data.get("command", "").upper()
+            if cmd not in ["ARM", "DEPLOY", "ABORT"]:
+                return jsonify({"status": "error", "message": "Invalid command"}), 400
+            log_cmd = cmd
+            # Old commands are acknowledged immediately (serial uplink not implemented here)
+            print(f"[COMMAND] {cmd} received (packet_id={packet_id})")
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("""
+                        INSERT INTO commands (session_id, command, status, packet_id, sent_at)
+                        VALUES (?, ?, ?, ?, datetime('now'))
+                    """, (current_session_id, cmd, "SENT", packet_id))
+                    conn.commit()
+            except Exception as db_err:
+                print(f"⚠️  Command DB logging error: {db_err}")
+            return jsonify({
+                "status": "sent",
+                "command": cmd,
+                "packet_id": packet_id,
+                "timestamp": time.time(),
+            })
+
+        # Queue for WiFi receiver
+        with _uplink_lock:
+            _uplink_queue.append(cmd_str)
+
+        # Log to DB
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("""
+                    INSERT INTO commands (session_id, command, status, packet_id, sent_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                """, (current_session_id, log_cmd, "QUEUED", packet_id))
+                conn.commit()
+        except Exception as db_err:
+            print(f"⚠️  Command DB logging error: {db_err}")
+
+        print(f"[COMMAND] Queued for WiFi receiver: {cmd_str}")
         return jsonify({
-            "status": "sent",
-            "command": cmd,
-            "packet_id": packet_id,
-            "timestamp": time.time()
+            "status": "queued",
+            "queued": json.loads(cmd_str),
+            "message": "Queued; sent to CanSat within about a second.",
         })
+
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -1502,6 +2043,59 @@ def send_command():
 @require_gs_token
 def api_command():
     return send_command()
+
+
+# =====================================================================
+# WIFI RECEIVER ENDPOINTS  (no token — ESP32 cannot send headers)
+# NOTE: Run this server on a private WiFi network only.
+# =====================================================================
+
+@app.route("/api/telemetry", methods=["POST"])
+def wifi_telemetry():
+    """WiFi receiver (Glyph C6) posts one compact JSON packet from the CanSat.
+
+    Body must be a JSON object with key 'n' (sequence number).
+    No authentication token — the receiver cannot send headers.
+    This route is intentionally open for the local network.
+    """
+    raw = request.get_json(silent=True)
+    if not isinstance(raw, dict) or "n" not in raw:
+        with _uplink_lock:
+            _wifi_rx_state["bad"] += 1
+        return jsonify(error="invalid packet: must be a JSON object with 'n' key"), 400
+
+    result = ingest_packet(raw, source="wifi")
+    if result is None:
+        return jsonify(error="packet processing failed"), 400
+    return jsonify(ok=True)
+
+
+@app.route("/api/commands", methods=["GET"])
+def wifi_commands():
+    """WiFi receiver polls for pending uplink commands (heartbeat).
+
+    Also records the time of the poll as the receiver heartbeat.
+    Returns {"cmds": [...]}, empties the queue.
+    No authentication token — the receiver cannot send headers.
+    """
+    with _uplink_lock:
+        _wifi_rx_state["last_rx_poll_t"] = time.time()
+        out = list(_uplink_queue)
+        _uplink_queue.clear()
+
+    # Mark queued commands as SENT in the DB
+    if out:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("""
+                    UPDATE commands SET status='SENT', sent_at=datetime('now')
+                    WHERE status='QUEUED' AND session_id=?
+                """, (current_session_id,))
+                conn.commit()
+        except Exception as e:
+            print(f"⚠️  Command status update error: {e}")
+
+    return jsonify(cmds=out)
 
 
 @app.route("/db/stats", methods=["GET"])
@@ -1524,6 +2118,7 @@ def db_stats():
 
 
 @app.route("/db/export", methods=["GET"])
+@app.route("/api/export", methods=["GET"])
 def db_export():
     """Export all telemetry to CSV with metadata."""
     try:
@@ -1579,6 +2174,35 @@ def db_clear():
         return jsonify({"status": "Database and cache cleared"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/live/reset", methods=["POST", "GET"])
+def live_reset():
+    """Reset live flight buffer and start a fresh session on dashboard reload."""
+    global current_session_id, last_ts_value, data_version, _last_logged_phase, _session_boot_ts
+    now = time.time()
+    current_session_id = f"session_{int(now)}"
+    _last_logged_phase = "PRE-LAUNCH"
+    _session_boot_ts = None
+    with _lock:
+        flight_data.clear()
+        latest_data.clear()
+        packet_id_history.clear()
+        _last_gps_fix.clear()
+        _track_state.clear()
+        _track_state.update(_new_track_state())
+        data_version += 1
+    with _uplink_lock:
+        _wifi_rx_state["session_start_t"]  = None
+        _wifi_rx_state["last_packet_t"]    = None
+        _wifi_rx_state["lost"]             = 0
+        _wifi_rx_state["bad"]              = 0
+        _wifi_rx_state["last_seq"]         = None
+        _wifi_rx_state["session_launched"] = False
+        _wifi_rx_state["session_ejected"]  = False
+    ai_cache.update({"analysis": None, "timestamp": None, "provider": None,
+                     "phase": "PRE-LAUNCH", "anomalies": [], "running": False})
+    return jsonify(ok=True, session_id=current_session_id)
 
 
 # =====================================================================
@@ -1939,36 +2563,41 @@ def get_anomalies():
 
 @app.route("/api/link-margin", methods=["GET"])
 def get_link_margin():
-    """Retrieve link margin metrics (RSSI, SNR, path loss, link margin)."""
+    """Retrieve link margin metrics (RSSI, SNR, path loss, link margin).
+
+    When rssi or snr is None (new E220 hardware), returns n/a strings instead
+    of computed numbers so the frontend can display 'n/a' rather than garbage.
+    """
     try:
         with _lock:
             latest = latest_data.copy()
-        
+
+        tx_power       = 14    # dBm (typical LoRa TX)
+        rx_sensitivity = -137  # dBm (E220 868 MHz typical)
+
         if not latest:
             return jsonify({
-                "rssi_dbm": None,
-                "snr_db": None,
-                "path_loss_db": 0,
-                "link_margin_db": 0,
-                "snr_quality": "—",
-                "tx_power_dbm": 14,
-                "rx_sensitivity_dbm": -137,
-                "packet_id": 0,
-                "timestamp": 0,
+                "rssi_dbm": None, "snr_db": None,
+                "path_loss_db": None, "link_margin_db": None,
+                "snr_quality": "n/a",
+                "tx_power_dbm": tx_power, "rx_sensitivity_dbm": rx_sensitivity,
+                "packet_id": 0, "timestamp": 0,
+                "e220_mode": True,
             }), 200
-        
-        rssi = latest.get("rssi", -110)
-        snr = latest.get("snr", 0)
-        
-        # Calculate link metrics
-        tx_power = 14  # dBm (typical LoRa TX)
-        rx_sensitivity = -137  # dBm (typical LoRa RX)
-        
-        path_loss = tx_power - rssi
-        link_margin = rssi - rx_sensitivity
-        
-        # SNR quality classification
-        if snr >= 10:
+
+        rssi = latest.get("rssi")  # None for new compact-format packets
+        snr  = latest.get("snr")   # None for new compact-format packets
+
+        if rssi is not None:
+            path_loss   = tx_power - rssi
+            link_margin = rssi - rx_sensitivity
+        else:
+            path_loss   = None
+            link_margin = None
+
+        if snr is None:
+            snr_quality = "n/a"
+        elif snr >= 10:
             snr_quality = "EXCELLENT"
         elif snr >= 7:
             snr_quality = "GOOD"
@@ -1976,17 +2605,18 @@ def get_link_margin():
             snr_quality = "FAIR"
         else:
             snr_quality = "POOR"
-        
+
         return jsonify({
-            "rssi_dbm": rssi,
-            "snr_db": snr,
-            "path_loss_db": path_loss,
-            "link_margin_db": link_margin,
-            "snr_quality": snr_quality,
-            "tx_power_dbm": tx_power,
+            "rssi_dbm":           rssi,
+            "snr_db":             snr,
+            "path_loss_db":       path_loss,
+            "link_margin_db":     link_margin,
+            "snr_quality":        snr_quality,
+            "tx_power_dbm":       tx_power,
             "rx_sensitivity_dbm": rx_sensitivity,
-            "packet_id": latest.get("packet_id", 0),
-            "timestamp": latest.get("ts", 0)
+            "packet_id":          latest.get("packet_id", 0),
+            "timestamp":          latest.get("ts", 0),
+            "e220_mode":          rssi is None,
         }), 200
     except Exception as e:
         print(f"⚠️  Link margin error: {e}")
@@ -2205,36 +2835,37 @@ def video_status():
 # =====================================================================
 if __name__ == "__main__":
     print("\n🚀 Starting Flight Telemetry Server…")
-    print(f"   Port      : {SERIAL_PORT} @ {BAUD_RATE} baud")
+    print(f"   Serial     : {SERIAL_PORT} @ {BAUD_RATE} baud")
+    print(f"   WiFi RX    : POST /api/telemetry  GET /api/commands  (no token, local net)")
     print(f"   AI interval: every {AI_ANALYSIS_INTERVAL}s")
+    print(f"   Launch thresholds: accel>{LAUNCH_ACCEL_THRESHOLD_G}g  alt>{LAUNCH_ALT_THRESHOLD_M}m")
 
     init_db()
 
-    # Preload historical data
-    saved = load_from_db(limit=MAX_FLIGHT_PACKETS)
-    if saved:
-        flight_data.extend(saved)
-        latest_data.update(saved[-1])
-        print(f"   Loaded {len(saved)} packets from DB")
+    # Initialise shared GPS / track state
+    _last_gps_fix.clear()
+    _track_state.update(_new_track_state())
+
+    # Start live telemetry buffer clean for fresh flight session
+    # Historical data remains archived in SQLite (telemetry.db) for session exports/queries
+    print("   Live buffer initialized clean (fresh session)")
 
     debug_mode = os.getenv("FLASK_DEBUG", "0") == "1"
-    gs_host = os.getenv("GS_BIND", "127.0.0.1")
+    gs_host = os.getenv("GS_BIND", "0.0.0.0")   # listen on all interfaces so WiFi receiver can reach
     gs_port = int(os.getenv("PORT", os.getenv("GS_PORT", "5000")))
 
     def _start_background_threads():
         threading.Thread(target=read_serial, daemon=True, name="serial-reader").start()
-        if ai_client:
-            threading.Thread(target=continuous_ai_analysis, daemon=True, name="ai-analyser").start()
-        else:
-            print("⚠️  AI thread not started — set NVIDIA_API_KEY in .env")
+        threading.Thread(target=continuous_ai_analysis, daemon=True, name="ai-analyser").start()
 
     # Avoid double serial open when the Werkzeug reloader is on.
     if not debug_mode or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         _start_background_threads()
 
-    print(f"\n   Dashboard  : http://{gs_host}:{gs_port}")
-    print(f"   Test data  : POST http://{gs_host}:{gs_port}/test-data  (X-GS-Token)")
-    print(f"   AI latest  : http://{gs_host}:{gs_port}/api/ai-analysis/latest")
-    print(f"   CSV export : http://{gs_host}:{gs_port}/db/export\n")
+    print(f"\n   Dashboard  : http://localhost:{gs_port}")
+    print(f"   Receiver must POST to: http://<PC-LAN-IP>:{gs_port}/api/telemetry")
+    print(f"   Test data  : POST http://localhost:{gs_port}/test-data  (X-GS-Token)")
+    print(f"   AI latest  : http://localhost:{gs_port}/api/ai-analysis/latest")
+    print(f"   CSV export : http://localhost:{gs_port}/db/export\n")
 
     app.run(host=gs_host, port=gs_port, debug=False, use_reloader=False, threaded=True)

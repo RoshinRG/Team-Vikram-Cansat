@@ -9,6 +9,7 @@ env/
 
 # Database
 telemetry.db
+reports/
 
 # IDE
 .vscode/
@@ -19,3 +20,7 @@ telemetry.db
 # OS
 .DS_Store
 Thumbs.db
+
+# Hardware secrets — NEVER commit real credentials
+# Copy secrets.example.h -> secrets.h and fill in your values.
+secrets.h

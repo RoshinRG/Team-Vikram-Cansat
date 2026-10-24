@@ -1,6 +1,7 @@
 /* ════════════════ STATE ════════════════ */
 let velChart, altChart, trajChart, tempChart, pressChart, altProfilChart, descentRateChart;
-let missionStartTime = null;
+const _savedStart = localStorage.getItem('vikram_mission_start_time');
+let missionStartTime = _savedStart ? Number(_savedStart) : null;
 let darkModeEnabled = localStorage.getItem('darkMode') === 'true';
 let tData = [], vData = [], aData = [], rData = [], azData = [], tempData = [], pressData = [], distData = [], altProfilData = [], descentRateData = [];
 let altProfilMeta = [];
@@ -71,7 +72,7 @@ function gpsBearing(lat1, lon1, lat2, lon2) {
 }
 
 function applyLinkStatus(stat) {
-    const live = !!(stat && stat.serial_connected);
+    const live = !!(stat && (stat.serial_connected || stat.connected || stat.link_ok));
     const hasData = !!(stat && (stat.has_telemetry || stat.packets_received));
     const dot = document.getElementById('dotInd');
     const el = document.getElementById('sText');
@@ -113,16 +114,16 @@ function chartTheme() {
 
 function scaleOpts(yLbl, extra = {}) {
     const t = chartTheme();
-    const withAnnotations = extra.annotations === true;
+    const hasPlugin = typeof Chart !== 'undefined' && Chart.registry && Chart.registry.plugins && !!Chart.registry.plugins.get('annotation');
+    const withAnnotations = extra.annotations === true && hasPlugin;
     const beginAtZero = extra.beginAtZero === true;
-    return {
+    const opts = {
         responsive: true,
         maintainAspectRatio: false,
         resizeDelay: 80,
         animation: { duration: 200 },
         plugins: {
-            legend: { display: false },
-            annotation: withAnnotations ? { annotations: {} } : undefined
+            legend: { display: false }
         },
         layout: { padding: { top: 8, right: 10, bottom: 4, left: 8 } },
         scales: {
@@ -140,6 +141,10 @@ function scaleOpts(yLbl, extra = {}) {
             }
         }
     };
+    if (withAnnotations) {
+        opts.plugins.annotation = { annotations: {} };
+    }
+    return opts;
 }
 
 function allCharts() {
@@ -189,12 +194,36 @@ function applyChartTheme() {
     });
 }
 
+function safeCreateChart(id, config) {
+    const el = document.getElementById(id);
+    if (!el) {
+        console.warn(`Chart canvas #${id} not found in DOM`);
+        return null;
+    }
+    try {
+        return new Chart(el, config);
+    } catch (err) {
+        console.error(`Chart init failed for #${id}:`, err);
+        try {
+            const cleanConfig = Object.assign({}, config, {
+                options: Object.assign({}, config.options || {}, {
+                    plugins: { legend: { display: false } }
+                })
+            });
+            return new Chart(el, cleanConfig);
+        } catch (err2) {
+            console.error(`Fallback failed for #${id}:`, err2);
+            return null;
+        }
+    }
+}
+
 function initCharts() {
     if (typeof Chart !== 'undefined') {
         const plugin = window.ChartAnnotation || window['chartjs-plugin-annotation'];
         if (plugin) { try { Chart.register(plugin); } catch (e) { /* already registered */ } }
     }
-    velChart = new Chart(document.getElementById('velChart'), {
+    velChart = safeCreateChart('velChart', {
         type: 'line',
         data: {
             labels: tData, datasets: [{
@@ -205,7 +234,7 @@ function initCharts() {
         },
         options: scaleOpts('Accel Magnitude (g)', { beginAtZero: true })
     });
-    altChart = new Chart(document.getElementById('altChart'), {
+    altChart = safeCreateChart('altChart', {
         type: 'line',
         data: {
             labels: tData, datasets: [{
@@ -216,7 +245,7 @@ function initCharts() {
         },
         options: scaleOpts('Altitude (m)', { beginAtZero: true, annotations: true })
     });
-    trajChart = new Chart(document.getElementById('trajChart'), {
+    trajChart = safeCreateChart('trajChart', {
         type: 'line',
         data: {
             labels: tData,
@@ -260,7 +289,7 @@ function initCharts() {
             };
         })()
     });
-    tempChart = new Chart(document.getElementById('tempChart'), {
+    tempChart = safeCreateChart('tempChart', {
         type: 'line',
         data: {
             labels: tData, datasets: [{
@@ -271,7 +300,7 @@ function initCharts() {
         },
         options: scaleOpts('Temperature (°C)')
     });
-    pressChart = new Chart(document.getElementById('pressChart'), {
+    pressChart = safeCreateChart('pressChart', {
         type: 'line',
         data: {
             labels: tData, datasets: [{
@@ -282,7 +311,7 @@ function initCharts() {
         },
         options: scaleOpts('Pressure (hPa)')
     });
-    altProfilChart = new Chart(document.getElementById('altProfilChart'), {
+    altProfilChart = safeCreateChart('altProfilChart', {
         type: 'line',
         data: {
             datasets: [
@@ -319,6 +348,45 @@ function initCharts() {
         },
         options: (() => {
             const t = chartTheme();
+            const hasPlugin = typeof Chart !== 'undefined' && Chart.registry && Chart.registry.plugins && !!Chart.registry.plugins.get('annotation');
+            const plugins = {
+                legend: {
+                    display: true,
+                    labels: { color: t.legend, boxWidth: 12, font: { size: 10 } }
+                },
+                tooltip: {
+                    enabled: true,
+                    filter(item) {
+                        return item && item.raw && item.raw.y != null;
+                    },
+                    callbacks: {
+                        title(items) {
+                            const raw = items[0] && items[0].raw;
+                            if (!raw || raw.y == null) return '';
+                            return `t = ${((raw.ts || 0) / 1000).toFixed(2)} s`;
+                        },
+                        label() { return ''; },
+                        afterBody(items) {
+                            const raw = items[0] && items[0].raw;
+                            if (!raw || raw.y == null) return [];
+                            const src = raw.source === 'gps' ? 'GPS-derived'
+                                : raw.source === 'estimated' ? 'Estimated (no GPS)'
+                                : 'No GPS fix';
+                            const lines = [
+                                `Altitude: ${Number(raw.y).toFixed(1)} m`,
+                                `Distance along track: ${Number(raw.x).toFixed(1)} m`,
+                                `v_z: ${Number(raw.vz || 0).toFixed(2)} m/s`,
+                                src
+                            ];
+                            if (raw.phase) lines.push(`Phase: ${String(raw.phase).replace(/_/g, ' ')}`);
+                            return lines;
+                        }
+                    }
+                }
+            };
+            if (hasPlugin) {
+                plugins.annotation = { annotations: {} };
+            }
             return {
                 responsive: true,
                 maintainAspectRatio: false,
@@ -326,42 +394,7 @@ function initCharts() {
                 animation: { duration: 200 },
                 parsing: false,
                 interaction: { mode: 'nearest', intersect: false, axis: 'x' },
-                plugins: {
-                    legend: {
-                        display: true,
-                        labels: { color: t.legend, boxWidth: 12, font: { size: 10 } }
-                    },
-                    annotation: { annotations: {} },
-                    tooltip: {
-                        enabled: true,
-                        filter(item) {
-                            return item && item.raw && item.raw.y != null;
-                        },
-                        callbacks: {
-                            title(items) {
-                                const raw = items[0] && items[0].raw;
-                                if (!raw || raw.y == null) return '';
-                                return `t = ${((raw.ts || 0) / 1000).toFixed(2)} s`;
-                            },
-                            label() { return ''; },
-                            afterBody(items) {
-                                const raw = items[0] && items[0].raw;
-                                if (!raw || raw.y == null) return [];
-                                const src = raw.source === 'gps' ? 'GPS-derived'
-                                    : raw.source === 'estimated' ? 'Estimated (no GPS)'
-                                    : 'No GPS fix';
-                                const lines = [
-                                    `Altitude: ${Number(raw.y).toFixed(1)} m`,
-                                    `Distance along track: ${Number(raw.x).toFixed(1)} m`,
-                                    `v_z: ${Number(raw.vz || 0).toFixed(2)} m/s`,
-                                    src
-                                ];
-                                if (raw.phase) lines.push(`Phase: ${String(raw.phase).replace(/_/g, ' ')}`);
-                                return lines;
-                            }
-                        }
-                    }
-                },
+                plugins: plugins,
                 layout: { padding: { top: 8, right: 10, bottom: 4, left: 8 } },
                 scales: {
                     x: {
@@ -382,7 +415,7 @@ function initCharts() {
             };
         })()
     });
-    descentRateChart = new Chart(document.getElementById('descentRateChart'), {
+    descentRateChart = safeCreateChart('descentRateChart', {
         type: 'line',
         data: {
             labels: tData, datasets: [{
@@ -618,19 +651,28 @@ function updateTelemetryUI(pt) {
     const aM = Math.sqrt(ax * ax + ay * ay + az * az);
     const gM = Math.sqrt(gx * gx + gy * gy + gz * gz);
 
-    document.getElementById('paramTime').textContent = ((pt.ts || 0) / 1000).toFixed(2);
+    try {
+        localStorage.setItem('vikram_latest_telemetry', JSON.stringify(pt));
+    } catch (e) { /* ignore */ }
+
+    const displayTime = pt.mission_time != null ? Number(pt.mission_time).toFixed(1) : ((pt.ts || 0) / 1000).toFixed(2);
+    document.getElementById('paramTime').textContent = displayTime;
     document.getElementById('paramAlt').textContent = (pt.alt || 0).toFixed(2);
     document.getElementById('paramAcc').textContent = aM.toFixed(3);
     document.getElementById('paramGyr').textContent = gM.toFixed(3);
 
     // New sensor metrics
-    document.getElementById('paramTemp').textContent = (pt.temp || 25).toFixed(1);
-    document.getElementById('paramPress').textContent = ((pt.pressure || 101325) / 100).toFixed(1);
-    document.getElementById('paramHumid').textContent = (pt.humidity || 50).toFixed(0);
-    document.getElementById('paramBatt').textContent = (pt.batt_v || 3.7).toFixed(2);
-    document.getElementById('paramRssi').textContent = (pt.rssi || -100).toFixed(0);
-    document.getElementById('paramSnr').textContent = (pt.snr || 0).toFixed(1);
-    updateGauges(pt.batt_v || 3.7, pt.rssi || -100);
+    document.getElementById('paramTemp').textContent = pt.temp != null ? Number(pt.temp).toFixed(1) : '25.0';
+    document.getElementById('paramPress').textContent = pt.pressure != null ? (Number(pt.pressure) / 100).toFixed(1) : '1013.2';
+    document.getElementById('paramHumid').textContent = pt.humidity != null ? Number(pt.humidity).toFixed(0) : '50';
+    document.getElementById('paramBatt').textContent = (pt.batt_v ?? 3.7).toFixed(2);
+    document.getElementById('paramRssi').textContent = pt.rssi != null ? Number(pt.rssi).toFixed(0) : '—';
+    document.getElementById('paramSnr').textContent = pt.snr != null ? Number(pt.snr).toFixed(1) : '—';
+    const gasEl = document.getElementById('paramGas');
+    if (gasEl) gasEl.textContent = pt.mq135 != null ? Math.round(pt.mq135) : '—';
+    const currEl = document.getElementById('paramCurr');
+    if (currEl) currEl.textContent = pt.current_ma != null ? Number(pt.current_ma).toFixed(0) : '—';
+    updateGauges(pt.batt_v ?? 3.7, pt.rssi != null ? Number(pt.rssi) : -100);
 
     document.getElementById('ax').textContent = ax.toFixed(4); document.getElementById('ay').textContent = ay.toFixed(4);
     document.getElementById('az').textContent = az.toFixed(4); document.getElementById('aM').textContent = aM.toFixed(4);
@@ -638,7 +680,7 @@ function updateTelemetryUI(pt) {
     document.getElementById('gz').textContent = gz.toFixed(4); document.getElementById('gM').textContent = gM.toFixed(4);
 
     document.getElementById('dAlt').textContent = (pt.alt || 0).toFixed(2) + ' m';
-    document.getElementById('dTs').textContent = ((pt.ts || 0) / 1000).toFixed(2) + ' s';
+    document.getElementById('dTs').textContent = displayTime + ' s';
 
     const bl = document.getElementById('bLaunch'), be = document.getElementById('bEject');
     bl.textContent = 'LAUNCHED: ' + (pt.launched ? 'YES' : 'NO'); bl.className = 'badge ' + (pt.launched ? 'ok' : 'off');
@@ -656,9 +698,11 @@ function updateTelemetryUI(pt) {
     // M6: Link margin calculations
     calculateLinkMetrics(pt);
 
-    // M5: Start mission clock on first packet
-    if (!missionStartTime && pt.launched) {
-        missionStartTime = Date.now();
+    // M5: Start or sync mission clock
+    if (!missionStartTime) {
+        const elapsedS = pt.mission_time != null ? Number(pt.mission_time) : 0;
+        missionStartTime = Date.now() - Math.round(elapsedS * 1000);
+        try { localStorage.setItem('vikram_mission_start_time', missionStartTime); } catch (e) { }
     }
 }
 
@@ -865,11 +909,63 @@ function resetChartBuffers() {
     tempData = []; pressData = []; distData = []; altProfilData = []; descentRateData = [];
     altProfilMeta = [];
     telemetryCursorTs = null;
+    chartGpsCtx = null;
+    refreshCharts();
+}
+
+function resetTelemetryUI() {
+    const pk = document.getElementById('pkts');
+    if (pk) pk.textContent = '0';
+    const dpts = document.getElementById('dpts');
+    if (dpts) dpts.textContent = '0';
+    const mc = document.getElementById('missionClock');
+    if (mc) mc.textContent = '00:00:00';
+
+    // Clear flight strip
+    const setT = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    setT('sumMaxAlt', '—');
+    setT('sumMaxSpd', '—');
+    setT('sumDuration', '—');
+    setT('sumPktSuccess', '—');
+    setT('sumPhase', 'PRE-LAUNCH');
+    setT('sumPktLoss', '0%');
+    setT('packetLoss', '0%');
+
+    // Clear parameter cards
+    const dash = ['paramTime', 'paramAlt', 'paramAcc', 'paramGyr', 'paramTemp',
+                  'paramPress', 'paramHumid', 'paramBatt', 'paramRssi', 'paramSnr',
+                  'paramGas', 'paramCurr', 'dAlt', 'dTs'];
+    dash.forEach(id => setT(id, '--'));
+
+    // Reset badges
+    const bl = document.getElementById('bLaunch'), be = document.getElementById('bEject');
+    if (bl) { bl.textContent = 'LAUNCHED: NO'; bl.className = 'badge off'; }
+    if (be) { be.textContent = 'EJECTED: NO'; be.className = 'badge off'; }
+
+    // Reset GPS stats & polyline
+    flightPath = [];
+    totalDist = 0;
+    maxAlt = -Infinity;
+    maxSpd = 0;
+    lastLatLng = null;
+    if (lfPolyline) lfPolyline.setLatLngs([]);
+    updateGPSStats(0, -Infinity, 0);
+
+    refreshCharts();
 }
 
 function ingestPacketForCharts(p, i, ctx) {
-    const t = (p.ts || i) / 1000;
-    tData.push(t.toFixed(2));
+    let t;
+    if (p.mission_time != null && Number.isFinite(Number(p.mission_time))) {
+        t = Number(p.mission_time);
+    } else if (ctx && ctx.baseTs != null && p.ts != null) {
+        t = Math.max(0, (p.ts - ctx.baseTs) / 1000);
+    } else if (p.ts != null && p.ts < 1e9) {
+        t = p.ts / 1000;
+    } else {
+        t = i;
+    }
+    tData.push(t.toFixed(1));
     const ax = p.ax || 0, ay = p.ay || 0, az = p.az || 0;
     vData.push(Math.sqrt(ax * ax + ay * ay + az * az));
     const alt = p.alt || 0;
@@ -878,36 +974,41 @@ function ingestPacketForCharts(p, i, ctx) {
     pressData.push((p.pressure || 101325) / 100);
 
     let descentRate = 0;
-    if (ctx.lastTime != null) {
+    if (ctx && ctx.lastTime != null) {
         const timeDiff = t - ctx.lastTime;
-        if (timeDiff > 0) descentRate = (ctx.lastAlt - alt) / timeDiff;
+        if (timeDiff > 0 && timeDiff < 60) descentRate = (ctx.lastAlt - alt) / timeDiff;
     }
     descentRateData.push(descentRate);
     attachDistanceAlongTrack(p, ctx);
-    ctx.lastAlt = alt;
-    ctx.lastTime = t;
+    if (ctx) {
+        ctx.lastAlt = alt;
+        ctx.lastTime = t;
+    }
 
     const lat = p.lat, lon = p.lon;
-    if (hasGpsFix(ctx.lastLat, ctx.lastLon) && hasGpsFix(lat, lon)) {
-        ctx.cumulativeDist += haversine(ctx.lastLat, ctx.lastLon, lat, lon);
-        ctx.lastHeading = gpsBearing(ctx.lastLat, ctx.lastLon, lat, lon);
-        ctx.gpsFixes += 1;
-    } else if (hasGpsFix(lat, lon) && !hasGpsFix(ctx.lastLat, ctx.lastLon)) {
-        ctx.gpsFixes += 1;
+    if (ctx) {
+        if (hasGpsFix(ctx.lastLat, ctx.lastLon) && hasGpsFix(lat, lon)) {
+            ctx.cumulativeDist += haversine(ctx.lastLat, ctx.lastLon, lat, lon);
+            ctx.lastHeading = gpsBearing(ctx.lastLat, ctx.lastLon, lat, lon);
+            ctx.gpsFixes += 1;
+        } else if (hasGpsFix(lat, lon) && !hasGpsFix(ctx.lastLat, ctx.lastLon)) {
+            ctx.gpsFixes += 1;
+        }
+        if (hasGpsFix(lat, lon)) {
+            ctx.lastLat = Number(lat);
+            ctx.lastLon = Number(lon);
+        }
+        rData.push(ctx.cumulativeDist / 1000);
+        azData.push(ctx.lastHeading);
     }
-    if (hasGpsFix(lat, lon)) {
-        ctx.lastLat = Number(lat);
-        ctx.lastLon = Number(lon);
-    }
-    rData.push(ctx.cumulativeDist / 1000);
-    azData.push(ctx.lastHeading);
     pushAltProfilSample(p);
     if (p.ts != null && p.ts > (telemetryCursorTs || 0)) telemetryCursorTs = p.ts;
 }
 
-function newChartIngestCtx() {
+function newChartIngestCtx(baseTs) {
     const n = tData.length;
     return {
+        baseTs: baseTs || null,
         cumulativeDist: n ? (Number(distData[n - 1]) || 0) * 1000 : 0,
         lastLat: null,
         lastLon: null,
@@ -925,17 +1026,38 @@ function newChartIngestCtx() {
 }
 
 function refreshCharts() {
-    if (!velChart) return;
-    velChart.data.labels = tData; velChart.data.datasets[0].data = vData; velChart.update('none');
-    altChart.data.labels = tData; altChart.data.datasets[0].data = aData; altChart.update('none');
-    tempChart.data.labels = tData; tempChart.data.datasets[0].data = tempData; tempChart.update('none');
-    pressChart.data.labels = tData; pressChart.data.datasets[0].data = pressData; pressChart.update('none');
-    descentRateChart.data.labels = tData; descentRateChart.data.datasets[0].data = descentRateData; descentRateChart.update('none');
+    if (velChart && velChart.data) {
+        velChart.data.labels = tData;
+        if (velChart.data.datasets && velChart.data.datasets[0]) velChart.data.datasets[0].data = vData;
+        velChart.update('none');
+    }
+    if (altChart && altChart.data) {
+        altChart.data.labels = tData;
+        if (altChart.data.datasets && altChart.data.datasets[0]) altChart.data.datasets[0].data = aData;
+        altChart.update('none');
+    }
+    if (tempChart && tempChart.data) {
+        tempChart.data.labels = tData;
+        if (tempChart.data.datasets && tempChart.data.datasets[0]) tempChart.data.datasets[0].data = tempData;
+        tempChart.update('none');
+    }
+    if (pressChart && pressChart.data) {
+        pressChart.data.labels = tData;
+        if (pressChart.data.datasets && pressChart.data.datasets[0]) pressChart.data.datasets[0].data = pressData;
+        pressChart.update('none');
+    }
+    if (descentRateChart && descentRateChart.data) {
+        descentRateChart.data.labels = tData;
+        if (descentRateChart.data.datasets && descentRateChart.data.datasets[0]) descentRateChart.data.datasets[0].data = descentRateData;
+        descentRateChart.update('none');
+    }
     refreshAltProfilChart();
-    if (trajChart) {
+    if (trajChart && trajChart.data) {
         trajChart.data.labels = tData;
-        trajChart.data.datasets[0].data = rData;
-        trajChart.data.datasets[1].data = azData;
+        if (trajChart.data.datasets) {
+            if (trajChart.data.datasets[0]) trajChart.data.datasets[0].data = rData;
+            if (trajChart.data.datasets[1]) trajChart.data.datasets[1].data = azData;
+        }
         trajChart.update('none');
     }
     const validGpsPts = rData.filter((r, i) => i > 0 && r !== rData[i - 1]).length;
@@ -986,8 +1108,24 @@ async function fetchTelemetry() {
             if (Array.isArray(full)) data = full;
         }
 
-        if (missionStartTime === null && (data.length > 0 || tData.length > 0)) {
-            missionStartTime = Date.now();
+        // Sync mission start time so refresh never starts from 00:00:00
+        if (stat && stat.session_start_t) {
+            missionStartTime = Math.round(stat.session_start_t * 1000);
+            try { localStorage.setItem('vikram_mission_start_time', missionStartTime); } catch (e) { }
+        } else if (data.length > 0) {
+            const lastP = data[data.length - 1];
+            if (lastP.mission_time != null && lastP.mission_time > 0) {
+                missionStartTime = Date.now() - Math.round(Number(lastP.mission_time) * 1000);
+                try { localStorage.setItem('vikram_mission_start_time', missionStartTime); } catch (e) { }
+            } else if (!missionStartTime) {
+                const firstTs = data[0].ts;
+                if (firstTs && firstTs > 1e11) {
+                    missionStartTime = firstTs;
+                } else {
+                    missionStartTime = Date.now();
+                }
+                try { localStorage.setItem('vikram_mission_start_time', missionStartTime); } catch (e) { }
+            }
         }
         updateMissionClock();
 
@@ -997,11 +1135,12 @@ async function fetchTelemetry() {
             if (fsm2) fsm2.textContent = aiData.phase;
         }
 
+        const baseTs = (data.length && data[0].ts) ? data[0].ts : null;
         if (!chartGpsCtx || tData.length === 0) {
             if (tData.length === 0) {
-                chartGpsCtx = Object.assign(newTrackCtx(), { cumulativeDist: 0, lastHeading: 0, gpsFixes: 0, lastTime: null });
+                chartGpsCtx = Object.assign(newTrackCtx(), { baseTs, cumulativeDist: 0, lastHeading: 0, gpsFixes: 0, lastTime: null });
             } else {
-                chartGpsCtx = newChartIngestCtx();
+                chartGpsCtx = Object.assign(newChartIngestCtx(baseTs), { baseTs });
             }
         }
         data.forEach((p, i) => ingestPacketForCharts(p, tData.length + i, chartGpsCtx));
@@ -1010,6 +1149,22 @@ async function fetchTelemetry() {
         if (dpts) dpts.textContent = tData.length;
 
         if (data.length > 0) {
+            // Reconstruct full GPS polyline on initial load / refresh
+            if (flightPath.length === 0 && mapReady && map && lfPolyline) {
+                data.forEach(p => {
+                    if (hasGpsFix(p.lat, p.lon)) {
+                        const ll = [Number(p.lat), Number(p.lon)];
+                        flightPath.push(ll);
+                        if (lastLatLng) totalDist += haversine(lastLatLng[0], lastLatLng[1], ll[0], ll[1]);
+                        lastLatLng = ll;
+                        if ((p.alt || 0) > maxAlt) maxAlt = p.alt;
+                        if ((p.speed || 0) > maxSpd) maxSpd = p.speed;
+                    }
+                });
+                if (flightPath.length > 0) {
+                    lfPolyline.setLatLngs(flightPath);
+                }
+            }
             const pt = data[data.length - 1];
             updateTelemetryUI(pt);
             detectAnomalies(data);
@@ -1121,6 +1276,30 @@ async function sendCommand(cmd) {
     return false;
 }
 
+async function sendHardwareCommand(payload, label) {
+    try {
+        const r = await fetch('/api/command', {
+            method: 'POST',
+            headers: Object.assign({ 'Content-Type': 'application/json' }, gsHeaders()),
+            body: JSON.stringify(payload)
+        });
+        const res = await r.json();
+        if (r.ok && res.status !== 'error') {
+            lastCommandTime = new Date().toLocaleTimeString();
+            lastCommandType = label;
+            document.getElementById('cmdLast').textContent = label;
+            playAudio('success');
+            toast('Uplink', label + ' queued', 'ok');
+            return true;
+        } else {
+            toast('Uplink', res.message || 'Command rejected', 'err');
+        }
+    } catch (e) {
+        toast('Uplink', 'Failed to reach ground station', 'err');
+    }
+    return false;
+}
+
 function updateCommandUI() {
     const armBtn = document.getElementById('btnArm'), deployBtn = document.getElementById('btnDeploy'), abortBtn = document.getElementById('btnAbort');
     const statusSpan = document.getElementById('cmdStatus');
@@ -1193,14 +1372,30 @@ function updateAnomalyTimeline() {
     const timeline = document.getElementById('anomalyTimeline');
     if (!timeline) return;
 
-    if (anomalies.length === 0) {
-        timeline.innerHTML = '<div style="color:var(--dim)">No anomalies detected</div>';
+    if (!anomalies || anomalies.length === 0) {
+        timeline.innerHTML = '<div class="empty-msg">No anomalies detected</div>';
     } else {
-        timeline.innerHTML = anomalies.map(a =>
-            `<div style="padding:6px;background:${a.severity === 'HIGH' ? 'rgba(255,76,106,.1)' : 'rgba(255,215,0,.1)'};border-left:3px solid ${a.severity === 'HIGH' ? 'var(--red)' : 'var(--gold)'};border-radius:2px;margin:4px 0;font-size:.85em">
-                <span style="color:${a.severity === 'HIGH' ? 'var(--red)' : 'var(--gold)'}"><strong>${a.type}</strong></span> - ${a.value}
-            </div>`
-        ).join('');
+        const grouped = [];
+        for (const a of anomalies) {
+            const last = grouped[grouped.length - 1];
+            if (last && last.type === a.type && last.value === a.value && last.severity === a.severity) {
+                last.count = (last.count || 1) + 1;
+            } else {
+                grouped.push(Object.assign({}, a, { count: 1 }));
+            }
+        }
+
+        timeline.innerHTML = grouped.map(a => {
+            const sevClass = a.severity === 'HIGH' ? 'anomaly-item--high' : 'anomaly-item--warn';
+            const countBadge = a.count > 1 ? `<span class="anomaly-badge">×${a.count}</span>` : '';
+            return `
+                <div class="anomaly-item ${sevClass}">
+                    <span class="anomaly-type">${escapeHtml(a.type)}</span>
+                    <span class="anomaly-desc">${escapeHtml(String(a.value || ''))}</span>
+                    ${countBadge}
+                </div>
+            `;
+        }).join('');
     }
 }
 
@@ -1225,15 +1420,23 @@ function playAudio(type) {
 /* ════════════════ AI ANALYSIS ════════════════ */
 async function runAi() {
     const btn = document.getElementById('btnAi'), out = document.getElementById('aiOut');
-    btn.disabled = true; btn.textContent = 'Analysing…';
-    out.innerHTML = '<em>Connecting to flight intelligence…</em>';
+    if (btn) { btn.disabled = true; btn.textContent = 'Analysing…'; }
+    if (out) out.innerHTML = '<em>Running Nemotron AI flight analysis…</em>';
     try {
-        const r = await fetch('/api/ai-analysis'); const d = await r.json();
-        if (d.analysis) out.innerHTML = escapeHtml(d.analysis).replace(/\n/g, '<br>');
-        else if (d.error) out.innerHTML = `<span style="color:var(--red)">Analysis failed: ${escapeHtml(d.error)}</span>`;
+        const r = await fetch('/api/ai-analysis');
+        const d = await r.json();
+        if (d.analysis && out) {
+            const src = d.provider ? `<div class="ai-src">${escapeHtml(d.provider)}</div>` : '';
+            const reasoning = d.reasoning ? `<details class="ai-reasoning" style="margin-bottom:10px;opacity:0.9;font-size:0.85em;"><summary style="cursor:pointer;color:var(--gold,#c9640a)">🧠 Thought Process (Nemotron Thinking)</summary><div style="padding:6px 0;white-space:pre-wrap;font-family:IBM Plex Mono,monospace;line-height:1.4;">${escapeHtml(d.reasoning)}</div></details>` : '';
+            out.innerHTML = src + reasoning + escapeHtml(d.analysis).replace(/\n/g, '<br>');
+        } else if (d.error && out) {
+            out.innerHTML = `<span style="color:var(--red)">Analysis failed: ${escapeHtml(d.error)}</span>`;
+        }
     } catch (e) {
-        out.innerHTML = '<span style="color:var(--red)">Could not reach AI engine. Is app.py running?</span>';
-    } finally { btn.disabled = false; btn.textContent = 'Generate Live Report'; }
+        if (out) out.innerHTML = '<span style="color:var(--red)">Could not reach AI engine. Is app.py running?</span>';
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Generate Live Report'; }
+    }
 }
 
 /* ════════════════ PDR ENDPOINTS ════════════════ */
@@ -1312,7 +1515,7 @@ async function createEvent() {
 
 async function updateAnomaliesFromAPI() {
     try {
-        const r = await fetch('/api/anomalies?limit=20');
+        const r = await fetch('/api/anomalies?limit=30');
         const d = await r.json();
         const timeline = document.getElementById('anomalyTimeline');
 
@@ -1320,16 +1523,34 @@ async function updateAnomaliesFromAPI() {
 
         if (!d.anomalies || d.anomalies.length === 0) {
             timeline.innerHTML = '<div class="empty-msg">No anomalies detected</div>';
-        } else {
-            timeline.innerHTML = d.anomalies.map(a => {
-                const sevClass = a.severity === 'HIGH' ? 'anomaly-item--high' : 'anomaly-item--warn';
-                return `
-                    <div class="anomaly-item ${sevClass}">
-                        <span class="anomaly-type"><strong>${a.anomaly_type}</strong></span> - ${a.description}
-                    </div>
-                `;
-            }).join('');
+            return;
         }
+
+        // Group consecutive duplicate anomalies with repeat count badge
+        const grouped = [];
+        for (const a of d.anomalies) {
+            const last = grouped[grouped.length - 1];
+            if (last && last.anomaly_type === a.anomaly_type && last.description === a.description && last.severity === a.severity) {
+                last.count = (last.count || 1) + 1;
+                last.latest_at = a.created_at || last.latest_at;
+            } else {
+                grouped.push(Object.assign({}, a, { count: 1, latest_at: a.created_at }));
+            }
+        }
+
+        timeline.innerHTML = grouped.map(a => {
+            const sevClass = a.severity === 'HIGH' ? 'anomaly-item--high' : 'anomaly-item--warn';
+            const countBadge = a.count > 1 ? `<span class="anomaly-badge">×${a.count}</span>` : '';
+            const timeStr = a.latest_at ? `<span class="anomaly-time">${escapeHtml(a.latest_at.split(' ')[1] || a.latest_at)}</span>` : '';
+            return `
+                <div class="anomaly-item ${sevClass}">
+                    <span class="anomaly-type">${escapeHtml(a.anomaly_type)}</span>
+                    <span class="anomaly-desc">${escapeHtml(a.description || '')}</span>
+                    ${countBadge}
+                    ${timeStr}
+                </div>
+            `;
+        }).join('');
     } catch (e) {
         /* Silently fail if API not ready */
     }
@@ -1540,8 +1761,67 @@ function exportCsv() {
 }
 
 function exportPdfReport() {
-    window.open('/report', '_blank');
-    toast('Flight report', 'Opened print-ready report — use Print → Save as PDF', 'ok');
+    window.open('/report.pdf', '_blank');
+    toast('Flight report', 'Downloading PDF from local flight analysis', 'ok');
+}
+
+async function refreshPortsList() {
+    const portSelect = document.getElementById('comPortSelect');
+    if (!portSelect) return;
+    try {
+        const pr = await fetch('/ports');
+        const pd = await pr.json();
+        const currentActive = pd.current_port || 'COM3';
+        const ports = pd.ports_info || (pd.available_ports || []).map(p => ({ port: p, label: p }));
+        const selectedVal = portSelect.value;
+
+        // If user is actively inspecting options (has focus), avoid disrupting dropdown unless options changed
+        const currentOptions = [...portSelect.options].map(o => o.value).filter(Boolean);
+        const newOptions = ports.map(p => p.port);
+        const optionsChanged = currentOptions.length !== newOptions.length || currentOptions.some((v, i) => v !== newOptions[i]);
+
+        if (!optionsChanged && portSelect.options.length > 0 && !portSelect.options[0].textContent.includes('Scanning')) {
+            // Options are the same, just sync active marker
+            [...portSelect.options].forEach(o => {
+                if (o.value) {
+                    const isTarget = (o.value === currentActive);
+                    if (isTarget && !o.textContent.includes('(ACTIVE)')) {
+                        o.textContent = `${o.value} (ACTIVE)`;
+                    } else if (!isTarget && o.textContent.includes('(ACTIVE)')) {
+                        o.textContent = o.value;
+                    }
+                }
+            });
+            return;
+        }
+
+        portSelect.innerHTML = '';
+
+        if (ports.length > 0) {
+            const hdrOpt = document.createElement('option');
+            hdrOpt.value = '';
+            hdrOpt.textContent = `⚡ Available Ports (${ports.length})`;
+            portSelect.appendChild(hdrOpt);
+
+            ports.forEach(p => {
+                const opt = document.createElement('option');
+                opt.value = p.port;
+                const isActive = (p.port === currentActive);
+                opt.textContent = `${p.label || p.port}${isActive ? ' (ACTIVE)' : ''}`;
+                if (p.port === selectedVal || (!selectedVal && isActive)) {
+                    opt.selected = true;
+                }
+                portSelect.appendChild(opt);
+            });
+        } else {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = `No COM Ports Found (Target: ${currentActive})`;
+            portSelect.appendChild(opt);
+        }
+    } catch (e) {
+        console.warn('Could not load COM ports', e);
+    }
 }
 
 async function switchComPort(port) {
@@ -1558,13 +1838,7 @@ async function switchComPort(port) {
             return;
         }
         toast('COM port', `Switched to ${d.port}`, 'ok');
-        // Refresh labels
-        const sel = document.getElementById('comPortSelect');
-        if (sel) {
-            [...sel.options].forEach(o => {
-                o.textContent = o.value + (o.value === d.port ? ' (ACTIVE)' : '');
-            });
-        }
+        await refreshPortsList();
     } catch (e) {
         toast('Port switch failed', e.message, 'err');
     }
@@ -1744,9 +2018,14 @@ function wireUpgradeControls() {
     document.getElementById('btnExportCsv')?.addEventListener('click', exportCsv);
     document.getElementById('btnExportPdf')?.addEventListener('click', exportPdfReport);
     document.getElementById('btnAckReset')?.addEventListener('click', ackReset);
-    document.getElementById('comPortSelect')?.addEventListener('change', (e) => {
-        if (e.target.value) switchComPort(e.target.value);
-    });
+    const portSel = document.getElementById('comPortSelect');
+    if (portSel) {
+        portSel.addEventListener('change', (e) => {
+            if (e.target.value) switchComPort(e.target.value);
+        });
+        portSel.addEventListener('pointerdown', () => refreshPortsList());
+        portSel.addEventListener('focus', () => refreshPortsList());
+    }
     document.getElementById('sessionSelect')?.addEventListener('change', () => {
         toast('Session', `Selected ${document.getElementById('sessionSelect').value || 'live'}`, 'ok');
     });
@@ -1765,20 +2044,9 @@ window.addEventListener('load', async () => {
     try { initMap(); } catch (e) { console.warn('Map init failed', e); }
     setTimeout(resizeCharts, 120);
 
-    try {
-        const pr = await fetch('/ports');
-        const pd = await pr.json();
-        const portSelect = document.getElementById('comPortSelect');
-        if (pd.available_ports && pd.available_ports.length > 0) {
-            pd.available_ports.forEach(port => {
-                const opt = document.createElement('option');
-                opt.value = port;
-                opt.textContent = port + (port === pd.current_port ? ' (ACTIVE)' : '');
-                if (port === pd.current_port) opt.selected = true;
-                portSelect.appendChild(opt);
-            });
-        }
-    } catch (e) { console.log('Could not load COM ports'); }
+    // Initial port scan & periodic background polling
+    refreshPortsList();
+    setInterval(refreshPortsList, 4000);
 
     document.getElementById('btnAi').addEventListener('click', runAi);
     document.getElementById('btnDarkMode').addEventListener('click', toggleDarkMode);
@@ -1836,6 +2104,7 @@ window.addEventListener('load', async () => {
             }
         }
     });
+
     updateCommandUI();
 
     document.getElementById('btnRefreshCmdLog').addEventListener('click', fetchCommandLog);
@@ -1843,6 +2112,38 @@ window.addEventListener('load', async () => {
     document.getElementById('btnCreateEvent').addEventListener('click', createEvent);
 
     wireUpgradeControls();
+
+    // User requested: remove old data when reloading website -> clean fresh start
+    localStorage.removeItem('vikram_mission_start_time');
+    localStorage.removeItem('vikram_latest_telemetry');
+    missionStartTime = null;
+    updateMissionClock();
+    resetChartBuffers();
+    resetTelemetryUI();
+
+    // Call server to reset live buffer so old simulation / test packets are cleared
+    try {
+        fetch('/api/live/reset', { method: 'POST', headers: gsHeaders() });
+    } catch (e) { /* ignore */ }
+
+    const btnClearData = document.getElementById('btnClearData');
+    if (btnClearData) {
+        btnClearData.addEventListener('click', async () => {
+            if (confirm('Clear all live telemetry and start a fresh mission session?')) {
+                localStorage.removeItem('vikram_mission_start_time');
+                localStorage.removeItem('vikram_latest_telemetry');
+                missionStartTime = null;
+                updateMissionClock();
+                resetChartBuffers();
+                resetTelemetryUI();
+                try {
+                    await fetch('/api/live/reset', { method: 'POST', headers: gsHeaders() });
+                    toast('Session reset', 'Live telemetry and charts cleared', 'ok');
+                } catch (e) { }
+            }
+        });
+    }
+
     loadSessions();
     loadPhaseMarkers();
     refreshMissionSummary();
@@ -1886,7 +2187,7 @@ function handleVideoError() {
 
     clearTimeout(_vidRetryTimer);
     _vidRetryTimer = setTimeout(() => {
-        const img = document.getElementById('liveFeed');
+        const img = document.getElementById('Feed') || document.getElementById('liveFeed');
         if (!img) return;
         const base = img.src.split('?')[0];
         img.src = base + '?t=' + Date.now();
@@ -1901,7 +2202,7 @@ function handleVideoLoad() {
     const overlay = document.getElementById('vidOverlay');
     const badge   = document.getElementById('vidBadge');
     if (overlay) { overlay.classList.add('hidden'); }
-    if (badge)   { badge.textContent = 'LIVE'; badge.classList.remove('badge-offline'); }
+    if (badge)   { badge.textContent = 'ONLINE'; badge.classList.remove('badge-offline'); }
     clearTimeout(_vidRetryTimer);
 }
 
@@ -1911,7 +2212,7 @@ function handleVideoLoad() {
  */
 function switchVideoSource(url) {
     clearTimeout(_vidRetryTimer);
-    const img = document.getElementById('liveFeed');
+    const img = document.getElementById('Feed') || document.getElementById('liveFeed');
     if (!img) return;
     img.src = url + '?t=' + Date.now();
     toast('Video', 'Switching to ' + url, 'ok');
@@ -1922,7 +2223,7 @@ function switchVideoSource(url) {
  * canvas, then triggering a download.
  */
 function takeVideoSnapshot() {
-    const img = document.getElementById('liveFeed');
+    const img = document.getElementById('Feed') || document.getElementById('liveFeed');
     if (!img || !img.complete || img.naturalWidth === 0) {
         toast('Video', 'No live frame to capture', 'warn');
         return;
